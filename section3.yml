@@ -1,0 +1,13 @@
+# Section3 - Service Supervisor Configuration
+# https://github.com/tachikoma-ghost/section3
+
+services:
+  signalshell:
+    command: /home/node/.local/bin/signalshell serve
+    restart: always
+
+  voice:
+    command: /workspace/src/voice/bin/voice -config /workspace/src/voice/config.yaml
+    restart: always
+    depends_on:
+      - signalshell

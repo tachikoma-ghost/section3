@@ -1,42 +1,44 @@
 # Section3 — Service Supervisor
 
-A minimal Go service supervisor for Tachikoma. Fork+exec services from `/workspace/etc/sv/<name>/run`, restart on crash, handle logs.
+A minimal Go service supervisor for Tachikoma. Fork+exec services from YAML config, restart on crash, handle logs with rotation.
 
 ## Design
 
 - **Binary name:** `section3`
-- **Config:** no config file. Service discovery from `/workspace/etc/sv/<name>/run`
-- **Log location:** `/workspace/logs/<name>/current` (one file per service, append-only, rotated by supervisor)
+- **Config:** YAML file at `/workspace/section3.yml`
+- **Log location:** `/var/log/section3/<name>.log` (one file per service, rotated by supervisor)
 - **Entry point:** runs in foreground as PID 1 of the container
 
-## Service Definition
+## Configuration
 
-```
-/workspace/etc/sv/<name>/
-  run          # executable script, exec'd by supervisor
-  log/         # (optional) if exists, used for log rotation config
+```yaml
+services:
+  <name>:
+    command: /path/to/executable args...
+    restart: always | never
+    depends_on:
+      - other-service
 ```
 
 ## Startup
 
-1. Scan `/workspace/etc/sv/` for subdirectories with `run` files
-2. Sort alphabetically (use `1-name`, `2-name` prefixes for ordering)
-3. Fork+exec each service in order with small stagger (100ms)
-4. Wait for each to become ready before starting next (optional: configurable)
-5. Block in supervisor loop
+1. Read `/workspace/section3.yml`
+2. Sort service names alphabetically
+3. Fork+exec each service with small stagger (100ms)
+4. Block in supervisor loop
 
 ## Supervisor Loop
 
 - Monitor all supervised processes
 - On crash: restart with exponential backoff (min 1s, max 60s, multiplier 2x)
 - On SIGTERM: stop all services gracefully (SIGTERM, wait 5s, SIGKILL)
-- On SIGHUP: reload (re-scan `/workspace/etc/sv/`)
+- On SIGHUP: reload config
 
 ## Log Handling
 
 - Capture stdout + stderr of each service
-- Write to `/workspace/logs/<name>/current`
-- Rotate when file exceeds 1MB (rename to `current.<timestamp>`, start new `current`)
+- Write to `/var/log/section3/<name>.log`
+- Rotate when file exceeds 1MB (rename to `<name>.log.1`, start new `<name>.log`)
 - Keep last 5 rotated files per service
 
 ## Commands
@@ -45,9 +47,10 @@ A minimal Go service supervisor for Tachikoma. Fork+exec services from `/workspa
 section3 start <name>     Start a service
 section3 stop <name>      Stop a service
 section3 restart <name>   Restart a service
+section3 reload           Reload config (add/remove services)
 section3 status           Show status of all services
 section3 status <name>    Show status of one service
-section3 tail <name>     Tail logs (last 20 lines)
+section3 tail [-n N] [name]  Tail logs (default: 20 lines, all services if no name)
 section3 help             Show help
 ```
 
@@ -57,7 +60,6 @@ section3 help             Show help
 $ section3 status
 signalshell  running  PID 12345  uptime 2h34m
 voice        running  PID 12346  uptime 2h34m
-memory-watch stopped  exit 1    last restart 10s ago
 ```
 
 ## Exit Codes
@@ -68,7 +70,6 @@ memory-watch stopped  exit 1    last restart 10s ago
 
 ## Future Extensibility
 
-- Exponential backoff per service (via `backoff` file in service dir)
-- Notification webhook on crash (via `notify` file in service dir)
-- Log filter (via `filter` script that processes each log line)
-- Health check (via `check` script that supervisor polls)
+- Notification webhook on crash
+- Log filter (script that processes each log line)
+- Health check (script that supervisor polls)

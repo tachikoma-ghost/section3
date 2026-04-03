@@ -1,6 +1,6 @@
 # Section3 — Service Supervisor
 
-Minimal Go service supervisor. Fork+exec services from `/workspace/etc/sv/<name>/run`, restart on crash, handle logs.
+Minimal Go service supervisor with YAML config. Fork+exec services, restart on crash, handle logs with rotation.
 
 ## Quick Start
 
@@ -10,12 +10,20 @@ cd src/section3
 make build
 ```
 
-### Add a Service
-```bash
-mkdir -p /workspace/etc/sv/my-service
-echo '#!/bin/bash
-exec /path/to/my-binary --flags' > /workspace/etc/sv/my-service/run
-chmod +x /workspace/etc/sv/my-service/run
+### Configuration
+Edit `/workspace/section3.yml`:
+
+```yaml
+services:
+  signalshell:
+    command: /home/node/.local/bin/signalshell serve
+    restart: always
+
+  voice:
+    command: /workspace/src/voice/bin/voice -config /workspace/src/voice/config.yaml
+    restart: always
+    depends_on:
+      - signalshell
 ```
 
 ### Run
@@ -28,41 +36,29 @@ chmod +x /workspace/etc/sv/my-service/run
 ./bin/section3 status
 ```
 
-### Commands
+## Commands
 ```
-section3                  Start the supervisor (default when run without args)
-section3 status           Show status of all services
-section3 status <name>  Show status of one service
-section3 start <name>    Start a service
-section3 stop <name>     Stop a service
-section3 restart <name>  Restart a service
+section3               Start the supervisor (default when run without args)
+section3 status        Show status of all services
+section3 status <name> Show status of one service
+section3 start <name>  Start a service
+section3 stop <name>   Stop a service
+section3 restart <name> Restart a service
+section3 reload        Reload config (add/remove services)
 section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
-section3 help             Show this help
+section3 help          Show this help
 ```
+
+## Restart Options
+
+- `always` — restart on any exit (default)
+- `never` — do not restart
 
 ## Log Location
 
-Logs go to `/workspace/logs/<name>/current`
+Logs go to `/var/log/section3/<name>.log`
 
-Example:
-```
-/workspace/logs/signalshell/current
-/workspace/logs/voice/current
-```
-
-## Ordering
-
-Services start alphabetically. Use numeric prefixes for ordering:
-
-```
-/workspace/etc/sv/1-signalshell/run
-/workspace/etc/sv/2-voice/run
-```
-
-## Crash Recovery
-
-On crash, section3 restarts with exponential backoff:
-- 1s → 2s → 4s → ... → max 60s
+Log rotation: files rotate at 1MB, keeping last 5 versions (`.log.1` ... `.log.5`).
 
 ## Tachikoma Integration
 
@@ -76,9 +72,13 @@ exec /workspace/src/section3/bin/section3
 
 ```
 src/section3/
-  main.go      # source
-  Makefile     # build
-  SPEC.md      # design spec
-  VERSION      # version
-  bin/section3 # compiled binary
+  main.go         # source
+  Makefile        # build
+  README.md       # this file
+  DEVELOPMENT.md  # architecture notes
+  SPEC.md         # design spec
+  VERSION         # version
+  section3.yml    # sample config
+  go.mod
+  bin/section3    # compiled binary
 ```

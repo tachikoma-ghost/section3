@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"gopkg.in/yaml.v3"
 	"log"
 	"os"
 	"os/exec"
@@ -17,21 +18,32 @@ import (
 )
 
 const (
-	serviceDir   = "/workspace/etc/sv"
-	logDir       = "/workspace/logs"
+	configPath   = "/workspace/section3.yml"
+	logDir       = "/var/log/section3"
 	maxBackoff   = 60 * time.Second
 	backoffMul   = 2
 	startStagger = 100 * time.Millisecond
+	maxLogSize   = 1 * 1024 * 1024 // 1MB
+	maxLogFiles  = 5
 )
+
+type Config struct {
+	Services map[string]ServiceConfig `yaml:"services"`
+}
+
+type ServiceConfig struct {
+	Command   string   `yaml:"command"`
+	Restart   string   `yaml:"restart"` // always, never, on-crash
+	DependsOn []string `yaml:"depends_on"`
+}
 
 type Service struct {
 	Name    string
-	RunPath string
-	LogPath string
-	dir     string
-
+	Command string
+	Restart string
 	cmd     *exec.Cmd
 	logFile *os.File
+	logPath string
 
 	mu         sync.Mutex
 	stopped    bool
@@ -42,15 +54,16 @@ type Service struct {
 }
 
 type Supervisor struct {
-	services map[string]*Service
+	services    map[string]*Service
+	serviceKeys []string // sorted keys
 }
 
 func NewSupervisor() *Supervisor {
 	return &Supervisor{services: make(map[string]*Service)}
 }
 
-func (s *Supervisor) Discover() error {
-	entries, err := os.ReadDir(serviceDir)
+func (s *Supervisor) LoadConfig() error {
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -58,44 +71,55 @@ func (s *Supervisor) Discover() error {
 		return err
 	}
 
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		svc := &Service{
-			Name:    name,
-			dir:     filepath.Join(serviceDir, name),
-			RunPath: filepath.Join(serviceDir, name, "run"),
-			LogPath: filepath.Join(logDir, name, "current"),
-		}
-		if _, err := os.Stat(svc.RunPath); err == nil {
-			s.services[name] = svc
-		}
-	}
-	return nil
-}
-
-func (s *Service) LogDir() string {
-	return filepath.Join(logDir, s.Name)
-}
-
-func (s *Service) OpenLog() error {
-	dir := s.LogDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return err
 	}
 
-	f, err := os.OpenFile(s.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	s.serviceKeys = nil
+	for name, sc := range cfg.Services {
+		s.services[name] = &Service{
+			Name:    name,
+			Command: sc.Command,
+			Restart: sc.Restart,
+			logPath: filepath.Join(logDir, name+".log"),
+		}
+		s.serviceKeys = append(s.serviceKeys, name)
+	}
+	sort.Strings(s.serviceKeys)
+	return nil
+}
+
+func (s *Service) OpenLog() error {
+	// Ensure log directory exists
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return err
+	}
+
+	// Check rotation
+	s.checkRotation()
+
+	f, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	s.logFile = f
 	return nil
+}
+
+func (s *Service) checkRotation() {
+	fi, err := os.Stat(s.logPath)
+	if err != nil || fi.Size() < maxLogSize {
+		return
+	}
+
+	// Rotate: foo.log -> foo.log.1, foo.log.1 -> foo.log.2, etc.
+	for i := maxLogFiles - 1; i >= 1; i-- {
+		old := fmt.Sprintf("%s.%d", s.logPath, i)
+		new := fmt.Sprintf("%s.%d", s.logPath, i+1)
+		os.Rename(old, new)
+	}
+	os.Rename(s.logPath, s.logPath+".1")
 }
 
 func (s *Service) Start() error {
@@ -110,7 +134,7 @@ func (s *Service) Start() error {
 		return err
 	}
 
-	cmd := exec.Command(s.RunPath)
+	cmd := exec.Command("/bin/sh", "-c", s.Command)
 	cmd.Stdout = s.logFile
 	cmd.Stderr = s.logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -130,6 +154,13 @@ func (s *Service) Start() error {
 	return nil
 }
 
+func (s *Service) shouldRestart() bool {
+	if s.Restart == "never" {
+		return false
+	}
+	return true
+}
+
 func (s *Service) wait() {
 	err := s.cmd.Wait()
 
@@ -140,7 +171,11 @@ func (s *Service) wait() {
 		return
 	}
 
-	// Service exited
+	if !s.shouldRestart() {
+		log.Printf("[%s] exited: %v (not restarting, restart=never)", s.Name, err)
+		return
+	}
+
 	s.lastCrash = time.Now()
 	if s.backoff == 0 {
 		s.backoff = 1 * time.Second
@@ -154,16 +189,13 @@ func (s *Service) wait() {
 
 	log.Printf("[%s] exited: %v (restarting in %v, crash #%d)", s.Name, err, s.backoff, s.crashCount)
 
-	// Close log file
 	if s.logFile != nil {
 		s.logFile.Close()
 		s.logFile = nil
 	}
 
-	// Restart after backoff
 	time.Sleep(s.backoff)
 
-	// Check if stopped while sleeping
 	if s.stopped {
 		return
 	}
@@ -183,10 +215,8 @@ func (s *Service) Stop() error {
 		return nil
 	}
 
-	// SIGTERM process group
 	syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 
-	// Wait with timeout
 	done := make(chan struct{})
 	go func() {
 		cmd.Wait()
@@ -196,13 +226,11 @@ func (s *Service) Stop() error {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		// SIGKILL
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
 	}
 
-	// Close log
 	if s.logFile != nil {
 		s.logFile.Close()
 		s.logFile = nil
@@ -228,13 +256,7 @@ func (s *Service) Status() string {
 }
 
 func (s *Supervisor) StartAll() error {
-	names := make([]string, 0, len(s.services))
-	for name := range s.services {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
+	for _, name := range s.serviceKeys {
 		svc := s.services[name]
 		log.Printf("Starting %s...", name)
 		if err := svc.Start(); err != nil {
@@ -253,19 +275,10 @@ func (s *Supervisor) StopAll() {
 
 func (s *Supervisor) Status() string {
 	var lines []string
-	for _, name := range sortedKeys(s.services) {
+	for _, name := range s.serviceKeys {
 		lines = append(lines, s.services[name].Status())
 	}
 	return strings.Join(lines, "\n")
-}
-
-func sortedKeys(m map[string]*Service) []string {
-	var keys []string
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func Tail(name string, lines int) error {
@@ -274,7 +287,7 @@ func Tail(name string, lines int) error {
 		return fmt.Errorf("unknown service: %s", name)
 	}
 
-	f, err := os.Open(svc.LogPath)
+	f, err := os.Open(svc.logPath)
 	if err != nil {
 		return err
 	}
@@ -296,7 +309,7 @@ func Tail(name string, lines int) error {
 }
 
 func TailAll(lines int) error {
-	for _, name := range sortedKeys(supervisor.services) {
+	for _, name := range supervisor.serviceKeys {
 		fmt.Printf("=== %s ===\n", name)
 		if err := Tail(name, lines); err != nil {
 			fmt.Printf("  (no log file)\n")
@@ -309,12 +322,11 @@ var supervisor *Supervisor
 
 func main() {
 	supervisor = NewSupervisor()
-	if err := supervisor.Discover(); err != nil {
+	if err := supervisor.LoadConfig(); err != nil {
 		log.Fatal(err)
 	}
 
 	if len(os.Args) < 2 {
-		// Run as supervisor
 		log.Printf("section3: supervising %d services", len(supervisor.services))
 		supervisor.StartAll()
 
@@ -387,6 +399,31 @@ func main() {
 			fmt.Printf("unknown service: %s\n", name)
 			os.Exit(1)
 		}
+	case "reload":
+		old := supervisor.services
+		supervisor = NewSupervisor()
+		if err := supervisor.LoadConfig(); err != nil {
+			fmt.Printf("reload failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Stop services not in new config
+		for name, svc := range old {
+			if _, ok := supervisor.services[name]; !ok {
+				svc.Stop()
+				log.Printf("stopped %s (removed from config)", name)
+			}
+		}
+
+		// Start new services
+		for _, name := range supervisor.serviceKeys {
+			if _, ok := old[name]; !ok {
+				supervisor.services[name].Start()
+				log.Printf("started %s (added from config)", name)
+			}
+		}
+
+		fmt.Println("reloaded")
 	case "tail":
 		lines := 20
 		name := ""
@@ -423,14 +460,15 @@ func main() {
 		fmt.Println(`section3 - service supervisor
 
 Commands:
-  section3                  Start the supervisor (default when run without args)
-  section3 status           Show status of all services
-  section3 status <name>  Show status of one service
-  section3 start <name>    Start a service
-  section3 stop <name>     Stop a service
-  section3 restart <name>  Restart a service
-  section3 tail [-n N] [name]  Show last N log lines (default: 20, all services if no name)
-  section3 help             Show this help`)
+  section3               Start the supervisor (default when run without args)
+  section3 status        Show status of all services
+  section3 status <name> Show status of one service
+  section3 start <name>  Start a service
+  section3 stop <name>   Stop a service
+  section3 restart <name> Restart a service
+  section3 reload        Reload config (add/remove services)
+  section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
+  section3 help          Show this help`)
 	default:
 		fmt.Printf("unknown command: %s\n", os.Args[1])
 		os.Exit(2)
