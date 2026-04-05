@@ -20,6 +20,7 @@ import (
 const (
 	configPath   = "/workspace/section3.yml"
 	logDir       = "/tmp/section3-logs"
+	pidFile      = "/tmp/section3.pid"
 	maxBackoff   = 60 * time.Second
 	backoffMul   = 2
 	startStagger = 100 * time.Millisecond
@@ -343,6 +344,16 @@ func main() {
 
 	// --daemon flag: actually run the supervisor (child process after fork)
 	if os.Args[1] == "--daemon" {
+		// Kill any existing instance
+		if pidData, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil {
+				syscall.Kill(pid, syscall.SIGTERM)
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+		// Write our pid
+		os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
+
 		// Ensure log directory exists
 		if err := os.MkdirAll(logDir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "section3: failed to create log dir %s: %v\n", logDir, err)
