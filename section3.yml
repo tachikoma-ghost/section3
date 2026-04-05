@@ -11,3 +11,7 @@ services:
     restart: always
     depends_on:
       - signalshell
+
+  telegram:
+    command: /workspace/src/telegram/bin/telegram -config /workspace/src/telegram/config.yaml
+    restart: always
