@@ -19,7 +19,7 @@ import (
 
 const (
 	configPath   = "/workspace/section3.yml"
-	logDir       = "/var/log/section3"
+	logDir       = "/tmp/section3-logs"
 	maxBackoff   = 60 * time.Second
 	backoffMul   = 2
 	startStagger = 100 * time.Millisecond
@@ -327,7 +327,36 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
-		log.Printf("section3: supervising %d services", len(supervisor.services))
+		// Daemonize: use start-stop-daemon or nohup
+		binary, err := filepath.Abs(os.Args[0])
+		if err != nil {
+			log.Fatal(err)
+		}
+		cmd := exec.Command("nohup", binary, "--daemon")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = nil
+		cmd.Start()
+		fmt.Printf("section3: started as daemon (pid %d)\n", cmd.Process.Pid)
+		os.Exit(0)
+	}
+
+	// --daemon flag: actually run the supervisor (child process after fork)
+	if os.Args[1] == "--daemon" {
+		// Ensure log directory exists
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "section3: failed to create log dir %s: %v\n", logDir, err)
+			os.Exit(1)
+		}
+		// Redirect logs to file in logDir
+		logFd, err := os.OpenFile(filepath.Join(logDir, "section3.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "section3: failed to open log: %v\n", err)
+			os.Exit(1)
+		}
+		log.SetOutput(logFd)
+		log.SetFlags(log.LstdFlags)
+		log.Printf("section3: daemon starting, pid %d", os.Getpid())
 		supervisor.StartAll()
 
 		sig := make(chan os.Signal, 1)
