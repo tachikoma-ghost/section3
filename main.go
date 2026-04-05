@@ -34,6 +34,7 @@ type Config struct {
 
 type ServiceConfig struct {
 	Command   string   `yaml:"command"`
+	Dir       string   `yaml:"dir"`
 	Restart   string   `yaml:"restart"` // always, never, on-crash
 	DependsOn []string `yaml:"depends_on"`
 }
@@ -41,6 +42,7 @@ type ServiceConfig struct {
 type Service struct {
 	Name    string
 	Command string
+	Dir     string
 	Restart string
 	cmd     *exec.Cmd
 	logFile *os.File
@@ -82,6 +84,7 @@ func (s *Supervisor) LoadConfig() error {
 		s.services[name] = &Service{
 			Name:    name,
 			Command: sc.Command,
+			Dir:     sc.Dir,
 			Restart: sc.Restart,
 			logPath: filepath.Join(logDir, name+".log"),
 		}
@@ -138,6 +141,9 @@ func (s *Service) Start() error {
 	cmd := exec.Command("/bin/sh", "-c", s.Command)
 	cmd.Stdout = s.logFile
 	cmd.Stderr = s.logFile
+	if s.Dir != "" {
+		cmd.Dir = s.Dir
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
