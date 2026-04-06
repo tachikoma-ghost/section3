@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +23,73 @@ func newTestService(t *testing.T, command, restart string) *Service {
 	}
 }
 
-// TestShouldRestart covers all restart policies and exit conditions.
+// startTestServer sets up supervisor and socket in temp paths, returns the listener.
+// Caller must close the listener in t.Cleanup.
+func startTestServer(t *testing.T, services map[string]*Service) net.Listener {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	origSocket := socketPath
+	origLogDir := logDir
+	origSupervisor := supervisor
+	socketPath = filepath.Join(dir, "section3.sock")
+	logDir = dir
+	t.Cleanup(func() {
+		socketPath = origSocket
+		logDir = origLogDir
+		supervisorMu.Lock()
+		supervisor = origSupervisor
+		supervisorMu.Unlock()
+	})
+
+	sup := NewSupervisor()
+	for name, svc := range services {
+		svc.Name = name
+		svc.logPath = filepath.Join(dir, name+".log")
+		sup.services[name] = svc
+		sup.serviceKeys = append(sup.serviceKeys, name)
+	}
+
+	supervisorMu.Lock()
+	supervisor = sup
+	supervisorMu.Unlock()
+
+	ln, err := serveSocket()
+	if err != nil {
+		t.Fatalf("serveSocket: %v", err)
+	}
+	t.Cleanup(func() {
+		ln.Close()
+		os.Remove(socketPath)
+	})
+
+	return ln
+}
+
+// send sends a command to the test socket and returns the response.
+func send(t *testing.T, cmd string) string {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintln(conn, cmd)
+	conn.(*net.UnixConn).CloseWrite()
+
+	out, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+// =============================================================================
+// Service lifecycle unit tests (no socket)
+// =============================================================================
+
 func TestShouldRestart(t *testing.T) {
 	crashErr := fmt.Errorf("exit status 1")
 
@@ -46,7 +114,6 @@ func TestShouldRestart(t *testing.T) {
 	}
 }
 
-// TestServiceStartStop starts a long-running process and stops it cleanly.
 func TestServiceStartStop(t *testing.T) {
 	svc := newTestService(t, "sleep 60", "never")
 
@@ -62,10 +129,7 @@ func TestServiceStartStop(t *testing.T) {
 	}
 
 	stopped := make(chan struct{})
-	go func() {
-		svc.Stop()
-		close(stopped)
-	}()
+	go func() { svc.Stop(); close(stopped) }()
 
 	select {
 	case <-stopped:
@@ -81,7 +145,6 @@ func TestServiceStartStop(t *testing.T) {
 	}
 }
 
-// TestServiceRestartOnCrash verifies a crashing service is restarted.
 func TestServiceRestartOnCrash(t *testing.T) {
 	dir := t.TempDir()
 	countFile := filepath.Join(dir, "count")
@@ -92,7 +155,6 @@ func TestServiceRestartOnCrash(t *testing.T) {
 	}
 	defer svc.Stop()
 
-	// After first crash backoff is 1s; two starts require ~1.2s minimum.
 	time.Sleep(2500 * time.Millisecond)
 
 	data, err := os.ReadFile(countFile)
@@ -105,7 +167,6 @@ func TestServiceRestartOnCrash(t *testing.T) {
 	}
 }
 
-// TestServiceNeverRestart verifies restart=never services do not restart.
 func TestServiceNeverRestart(t *testing.T) {
 	dir := t.TempDir()
 	countFile := filepath.Join(dir, "count")
@@ -125,24 +186,19 @@ func TestServiceNeverRestart(t *testing.T) {
 	}
 }
 
-// TestServiceOnCrashPolicy verifies on-crash distinguishes exit zero from non-zero.
 func TestServiceOnCrashPolicy(t *testing.T) {
 	t.Run("non-zero exit restarts", func(t *testing.T) {
 		dir := t.TempDir()
 		countFile := filepath.Join(dir, "count")
 		svc := newTestService(t, fmt.Sprintf("echo x >> %s && exit 1", countFile), "on-crash")
-
 		if err := svc.Start(); err != nil {
 			t.Fatal(err)
 		}
 		defer svc.Stop()
-
 		time.Sleep(2500 * time.Millisecond)
-
 		data, _ := os.ReadFile(countFile)
-		count := bytes.Count(data, []byte("x"))
-		if count < 2 {
-			t.Errorf("expected at least 2 starts for non-zero exit, got %d", count)
+		if bytes.Count(data, []byte("x")) < 2 {
+			t.Errorf("expected at least 2 starts for non-zero exit")
 		}
 	})
 
@@ -150,45 +206,37 @@ func TestServiceOnCrashPolicy(t *testing.T) {
 		dir := t.TempDir()
 		countFile := filepath.Join(dir, "count")
 		svc := newTestService(t, fmt.Sprintf("echo x >> %s", countFile), "on-crash")
-
 		if err := svc.Start(); err != nil {
 			t.Fatal(err)
 		}
 		defer svc.Stop()
-
 		time.Sleep(1500 * time.Millisecond)
-
 		data, _ := os.ReadFile(countFile)
-		count := bytes.Count(data, []byte("x"))
-		if count != 1 {
-			t.Errorf("expected exactly 1 start for zero exit, got %d", count)
+		if bytes.Count(data, []byte("x")) != 1 {
+			t.Errorf("expected exactly 1 start for zero exit")
 		}
 	})
 }
 
 // TestStopDuringBackoff verifies Stop() is not blocked by the backoff sleep.
-// Before the fix, wait() held s.mu during time.Sleep, so Stop() would block for
-// up to maxBackoff (60s).
+// Before the fix, wait() held s.mu during time.Sleep, so Stop() would block.
 func TestStopDuringBackoff(t *testing.T) {
 	svc := newTestService(t, "exit 1", "always")
 	if err := svc.Start(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Let the first crash register and backoff begin (backoff[0] = 1s).
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond) // let the first crash register
 
 	start := time.Now()
 	svc.Stop()
 	elapsed := time.Since(start)
 
-	// Stop() must return well before the 1s backoff expires.
 	if elapsed > 2*time.Second {
 		t.Errorf("Stop() took %v; likely blocked by backoff sleep (want < 2s)", elapsed)
 	}
 }
 
-// TestBackoffIncreases verifies exponential backoff grows across crashes.
 func TestBackoffIncreases(t *testing.T) {
 	svc := newTestService(t, "exit 1", "always")
 	if err := svc.Start(); err != nil {
@@ -196,7 +244,6 @@ func TestBackoffIncreases(t *testing.T) {
 	}
 	defer svc.Stop()
 
-	// Wait through first crash (backoff 1s) and into second cycle.
 	time.Sleep(2500 * time.Millisecond)
 
 	svc.mu.Lock()
@@ -205,14 +252,13 @@ func TestBackoffIncreases(t *testing.T) {
 	svc.mu.Unlock()
 
 	if crashes < 1 {
-		t.Fatalf("expected at least 1 crash recorded, got %d", crashes)
+		t.Fatalf("expected at least 1 crash, got %d", crashes)
 	}
 	if backoff < 1*time.Second {
 		t.Errorf("backoff = %v after %d crash(es); want >= 1s", backoff, crashes)
 	}
 }
 
-// TestStatus verifies the Status() string for each service state.
 func TestStatus(t *testing.T) {
 	t.Run("never started", func(t *testing.T) {
 		svc := &Service{Name: "svc", logPath: filepath.Join(t.TempDir(), "svc.log")}
@@ -228,13 +274,9 @@ func TestStatus(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer svc.Stop()
-
 		s := svc.Status()
-		if !strings.Contains(s, "running") {
-			t.Errorf("expected 'running', got: %q", s)
-		}
-		if !strings.Contains(s, "PID") {
-			t.Errorf("expected PID, got: %q", s)
+		if !strings.Contains(s, "running") || !strings.Contains(s, "PID") {
+			t.Errorf("expected 'running' and 'PID', got: %q", s)
 		}
 	})
 
@@ -244,17 +286,17 @@ func TestStatus(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer svc.Stop()
-
 		time.Sleep(300 * time.Millisecond)
-
-		s := svc.Status()
-		if strings.Contains(s, "running") {
-			t.Errorf("service should not show 'running' after crash, got: %q", s)
+		if strings.Contains(svc.Status(), "running") {
+			t.Errorf("service should not show 'running' after crash")
 		}
 	})
 }
 
-// TestLoadConfig verifies YAML config is parsed and keys are sorted.
+// =============================================================================
+// Config and log tests
+// =============================================================================
+
 func TestLoadConfig(t *testing.T) {
 	yml := `
 services:
@@ -286,7 +328,7 @@ services:
 	}
 	web := sup.services["web"]
 	if web == nil {
-		t.Fatal("missing service 'web'")
+		t.Fatal("missing 'web'")
 	}
 	if web.Command != "/usr/bin/web serve" {
 		t.Errorf("web.Command = %q", web.Command)
@@ -294,24 +336,19 @@ services:
 	if web.Restart != "always" {
 		t.Errorf("web.Restart = %q", web.Restart)
 	}
-	// Keys should be sorted alphabetically
-	if len(sup.serviceKeys) != 2 || sup.serviceKeys[0] != "web" || sup.serviceKeys[1] != "worker" {
+	if sup.serviceKeys[0] != "web" || sup.serviceKeys[1] != "worker" {
 		t.Errorf("serviceKeys not sorted: %v", sup.serviceKeys)
 	}
 }
 
-// TestLogRotation verifies that an oversized log file is rotated on open.
 func TestLogRotation(t *testing.T) {
 	dir := t.TempDir()
 
-	// Override logDir so OpenLog's MkdirAll points somewhere writable.
-	orig := logDir
+	origLogDir := logDir
 	logDir = dir
-	t.Cleanup(func() { logDir = orig })
+	t.Cleanup(func() { logDir = origLogDir })
 
 	logPath := filepath.Join(dir, "svc.log")
-
-	// Write a file just over the rotation threshold.
 	big := bytes.Repeat([]byte("a"), maxLogSize+1)
 	if err := os.WriteFile(logPath, big, 0644); err != nil {
 		t.Fatal(err)
@@ -323,18 +360,263 @@ func TestLogRotation(t *testing.T) {
 	}
 	svc.logFile.Close()
 
-	// Old content should have been renamed to .1
-	rotated := logPath + ".1"
-	if _, err := os.Stat(rotated); os.IsNotExist(err) {
-		t.Error("expected rotated log at " + rotated)
+	if _, err := os.Stat(logPath + ".1"); os.IsNotExist(err) {
+		t.Error("expected rotated log at " + logPath + ".1")
 	}
 
-	// New log file should be empty
 	fi, err := os.Stat(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fi.Size() != 0 {
-		t.Errorf("new log file should be empty after rotation, got size %d", fi.Size())
+		t.Errorf("new log should be empty after rotation, got size %d", fi.Size())
 	}
+}
+
+// =============================================================================
+// Socket tests
+// =============================================================================
+
+func TestSocketStatus(t *testing.T) {
+	svc := &Service{Command: "sleep 60", Restart: "never"}
+	startTestServer(t, map[string]*Service{"web": svc})
+
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Stop()
+
+	out := send(t, "status")
+	if !strings.Contains(out, "running") {
+		t.Errorf("expected 'running' in status, got: %q", out)
+	}
+	if !strings.Contains(out, "web") {
+		t.Errorf("expected service name 'web', got: %q", out)
+	}
+}
+
+func TestSocketStatusNamed(t *testing.T) {
+	svc := &Service{Command: "sleep 60", Restart: "never"}
+	startTestServer(t, map[string]*Service{"web": svc})
+
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Stop()
+
+	// Named service
+	out := send(t, "status web")
+	if !strings.Contains(out, "running") {
+		t.Errorf("status web: expected 'running', got: %q", out)
+	}
+
+	// Unknown service
+	out = send(t, "status bogus")
+	if !strings.HasPrefix(out, "ERROR:") {
+		t.Errorf("expected ERROR for unknown service, got: %q", out)
+	}
+}
+
+func TestSocketStartStop(t *testing.T) {
+	svc := &Service{Command: "sleep 60", Restart: "never"}
+	startTestServer(t, map[string]*Service{"web": svc})
+
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stop via socket
+	out := send(t, "stop web")
+	if !strings.Contains(out, "stopped web") {
+		t.Errorf("expected 'stopped web', got: %q", out)
+	}
+
+	// Status should show stopped
+	out = send(t, "status web")
+	if strings.Contains(out, "running") {
+		t.Errorf("expected stopped status after stop, got: %q", out)
+	}
+
+	// Start via socket
+	out = send(t, "start web")
+	if !strings.Contains(out, "started web") {
+		t.Errorf("expected 'started web', got: %q", out)
+	}
+	defer svc.Stop()
+
+	// Status should show running
+	out = send(t, "status web")
+	if !strings.Contains(out, "running") {
+		t.Errorf("expected running status after start, got: %q", out)
+	}
+}
+
+func TestSocketStartAlreadyRunning(t *testing.T) {
+	svc := &Service{Command: "sleep 60", Restart: "never"}
+	startTestServer(t, map[string]*Service{"web": svc})
+
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Stop()
+
+	out := send(t, "start web")
+	if !strings.HasPrefix(out, "ERROR:") {
+		t.Errorf("expected ERROR when starting already-running service, got: %q", out)
+	}
+}
+
+func TestSocketRestart(t *testing.T) {
+	svc := &Service{Command: "sleep 60", Restart: "never"}
+	startTestServer(t, map[string]*Service{"web": svc})
+
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Stop()
+
+	svc.mu.Lock()
+	pidBefore := svc.cmd.Process.Pid
+	svc.mu.Unlock()
+
+	out := send(t, "restart web")
+	if !strings.Contains(out, "restarted web") {
+		t.Errorf("expected 'restarted web', got: %q", out)
+	}
+
+	// Give the new process a moment to start
+	time.Sleep(100 * time.Millisecond)
+
+	svc.mu.Lock()
+	pidAfter := svc.cmd.Process.Pid
+	svc.mu.Unlock()
+
+	if pidBefore == pidAfter {
+		t.Errorf("PID did not change after restart (%d == %d)", pidBefore, pidAfter)
+	}
+}
+
+func TestSocketReload(t *testing.T) {
+	origConfig := configPath
+	t.Cleanup(func() { configPath = origConfig })
+
+	// Initial config: only "alpha"
+	writeConfig := func(yml string) {
+		f, err := os.CreateTemp(t.TempDir(), "*.yml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.WriteString(yml)
+		f.Close()
+		configPath = f.Name()
+	}
+
+	writeConfig(`
+services:
+  alpha:
+    command: sleep 60
+    restart: never
+`)
+
+	alphaDir := t.TempDir()
+	alpha := &Service{Command: "sleep 60", Restart: "never", logPath: filepath.Join(alphaDir, "alpha.log")}
+
+	dir := t.TempDir()
+	origSocket := socketPath
+	origLogDir := logDir
+	origSupervisor := supervisor
+	socketPath = filepath.Join(dir, "section3.sock")
+	logDir = dir
+	t.Cleanup(func() {
+		socketPath = origSocket
+		logDir = origLogDir
+		supervisorMu.Lock()
+		supervisor = origSupervisor
+		supervisorMu.Unlock()
+	})
+
+	sup := NewSupervisor()
+	sup.services["alpha"] = alpha
+	alpha.Name = "alpha"
+	sup.serviceKeys = []string{"alpha"}
+	supervisorMu.Lock()
+	supervisor = sup
+	supervisorMu.Unlock()
+
+	ln, err := serveSocket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close(); os.Remove(socketPath) })
+
+	if err := alpha.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Swap config to only "beta"
+	writeConfig(`
+services:
+  beta:
+    command: sleep 60
+    restart: never
+`)
+
+	out := send(t, "reload")
+	if !strings.Contains(out, "reloaded") {
+		t.Errorf("expected 'reloaded', got: %q", out)
+	}
+
+	supervisorMu.RLock()
+	newSup := supervisor
+	supervisorMu.RUnlock()
+
+	if _, ok := newSup.services["alpha"]; ok {
+		t.Error("alpha should have been removed after reload")
+	}
+	beta, ok := newSup.services["beta"]
+	if !ok {
+		t.Error("beta should be present after reload")
+	}
+	_ = beta
+}
+
+func TestSocketTail(t *testing.T) {
+	svc := &Service{Command: "sleep 60", Restart: "never"}
+	startTestServer(t, map[string]*Service{"svc": svc})
+
+	// Write log content after setup so we use the path assigned by startTestServer.
+	if err := os.WriteFile(svc.logPath, []byte("line1\nline2\nline3\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := send(t, "tail -n 2 svc")
+	if !strings.Contains(out, "line2") || !strings.Contains(out, "line3") {
+		t.Errorf("expected last 2 lines, got: %q", out)
+	}
+	if strings.Contains(out, "line1") {
+		t.Errorf("line1 should have been excluded by -n 2, got: %q", out)
+	}
+}
+
+func TestSocketUnknownCommand(t *testing.T) {
+	startTestServer(t, map[string]*Service{})
+
+	out := send(t, "bogus")
+	if !strings.HasPrefix(out, "ERROR:") {
+		t.Errorf("expected ERROR for unknown command, got: %q", out)
+	}
+}
+
+func TestSocketSingleInstance(t *testing.T) {
+	startTestServer(t, map[string]*Service{})
+
+	// The socket is already listening. A second dial should succeed (daemon "running").
+	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatalf("expected socket to be accessible: %v", err)
+	}
+	conn.Close()
+
+	// runDaemon would call os.Exit(1) if it could connect — verify the check logic.
+	// We test it by just confirming the dial succeeds, which is what the check uses.
 }

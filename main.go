@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,16 +21,24 @@ import (
 var (
 	configPath = "/workspace/section3.yml"
 	logDir     = "/tmp/section3-logs"
+	socketPath = "/tmp/section3.sock"
 )
 
 const (
-	pidFile      = "/tmp/section3.pid"
 	maxBackoff   = 60 * time.Second
 	backoffMul   = 2
 	startStagger = 100 * time.Millisecond
 	maxLogSize   = 1 * 1024 * 1024 // 1MB
 	maxLogFiles  = 5
 )
+
+// supervisor is the live instance; swapped atomically by reloadConfig.
+var (
+	supervisor   *Supervisor
+	supervisorMu sync.RWMutex
+)
+
+// --- Types ---
 
 type Config struct {
 	Services map[string]ServiceConfig `yaml:"services"`
@@ -53,8 +62,8 @@ type Service struct {
 
 	mu         sync.Mutex
 	stopped    bool
-	running    bool          // true while process is alive
-	done       chan struct{}  // closed by wait() when process exits; nil until first Start()
+	running    bool         // true while process is alive
+	done       chan struct{} // closed by wait() when process exits
 	crashCount int
 	backoff    time.Duration
 	startTime  time.Time
@@ -63,12 +72,14 @@ type Service struct {
 
 type Supervisor struct {
 	services    map[string]*Service
-	serviceKeys []string // sorted keys
+	serviceKeys []string // sorted
 }
 
 func NewSupervisor() *Supervisor {
 	return &Supervisor{services: make(map[string]*Service)}
 }
+
+// --- Config ---
 
 func (s *Supervisor) LoadConfig() error {
 	data, err := os.ReadFile(configPath)
@@ -99,11 +110,12 @@ func (s *Supervisor) LoadConfig() error {
 	return nil
 }
 
+// --- Log ---
+
 func (s *Service) OpenLog() error {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return err
 	}
-
 	s.checkRotation()
 
 	f, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
@@ -119,21 +131,23 @@ func (s *Service) checkRotation() {
 	if err != nil || fi.Size() < maxLogSize {
 		return
 	}
-
-	// Rotate: foo.log -> foo.log.1, foo.log.1 -> foo.log.2, etc.
 	for i := maxLogFiles - 1; i >= 1; i-- {
-		old := fmt.Sprintf("%s.%d", s.logPath, i)
-		new := fmt.Sprintf("%s.%d", s.logPath, i+1)
-		os.Rename(old, new)
+		os.Rename(fmt.Sprintf("%s.%d", s.logPath, i), fmt.Sprintf("%s.%d", s.logPath, i+1))
 	}
 	os.Rename(s.logPath, s.logPath+".1")
 }
+
+// --- Service lifecycle ---
 
 func (s *Service) Start() error {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
 		return fmt.Errorf("service is stopped")
+	}
+	if s.running {
+		s.mu.Unlock()
+		return fmt.Errorf("already running")
 	}
 	s.mu.Unlock()
 
@@ -147,9 +161,7 @@ func (s *Service) Start() error {
 	if s.Dir != "" {
 		cmd.Dir = s.Dir
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		return err
@@ -168,19 +180,17 @@ func (s *Service) Start() error {
 	return nil
 }
 
-// shouldRestart returns whether the service should be restarted given its exit error.
 func (s *Service) shouldRestart(exitErr error) bool {
 	switch s.Restart {
 	case "never":
 		return false
 	case "on-crash":
-		return exitErr != nil // only restart on non-zero exit
+		return exitErr != nil
 	default: // "always"
 		return true
 	}
 }
 
-// wait is the sole goroutine that calls cmd.Wait(). It owns the process lifecycle.
 func (s *Service) wait(done chan struct{}) {
 	defer close(done)
 
@@ -226,10 +236,9 @@ func (s *Service) wait(done chan struct{}) {
 		s.logFile = nil
 	}
 
-	s.mu.Unlock() // release before sleeping and restarting
+	s.mu.Unlock()
 
 	log.Printf("[%s] exited: %v (restarting in %v, crash #%d)", s.Name, err, backoff, crashCount)
-
 	time.Sleep(backoff)
 
 	s.mu.Lock()
@@ -263,12 +272,11 @@ func (s *Service) Stop() error {
 	if done != nil {
 		select {
 		case <-done:
-			// wait() exited cleanly
 		case <-time.After(5 * time.Second):
 			if cmd.Process != nil {
 				cmd.Process.Kill()
 			}
-			<-done // wait for wait() to finish after kill
+			<-done
 		}
 	}
 
@@ -298,16 +306,17 @@ func (s *Service) Status() string {
 	return fmt.Sprintf("%-12s running  PID %d  uptime %s", s.Name, s.cmd.Process.Pid, uptime)
 }
 
-func (s *Supervisor) StartAll() error {
+// --- Supervisor ---
+
+func (s *Supervisor) StartAll() {
 	for _, name := range s.serviceKeys {
 		svc := s.services[name]
-		log.Printf("Starting %s...", name)
+		log.Printf("starting %s...", name)
 		if err := svc.Start(); err != nil {
 			log.Printf("[%s] failed to start: %v", name, err)
 		}
 		time.Sleep(startStagger)
 	}
-	return nil
 }
 
 func (s *Supervisor) StopAll() {
@@ -324,267 +333,320 @@ func (s *Supervisor) Status() string {
 	return strings.Join(lines, "\n")
 }
 
-func Tail(name string, lines int) error {
-	svc, ok := supervisor.services[name]
+func (s *Supervisor) Tail(name string, n int) string {
+	svc, ok := s.services[name]
 	if !ok {
-		return fmt.Errorf("unknown service: %s", name)
+		return fmt.Sprintf("ERROR: unknown service: %s", name)
 	}
-
 	f, err := os.Open(svc.logPath)
 	if err != nil {
-		return err
+		return "(no log file)"
 	}
 	defer f.Close()
 
-	var tail []string
+	var lines []string
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		tail = append(tail, scanner.Text())
-		if len(tail) > lines {
-			tail = tail[len(tail)-lines:]
+		lines = append(lines, scanner.Text())
+		if len(lines) > n {
+			lines = lines[len(lines)-n:]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// --- Config reload ---
+
+func reloadConfig() error {
+	newSup := NewSupervisor()
+	if err := newSup.LoadConfig(); err != nil {
+		return err
+	}
+
+	supervisorMu.RLock()
+	old := supervisor
+	supervisorMu.RUnlock()
+
+	// Stop services removed from config.
+	for name, svc := range old.services {
+		if _, ok := newSup.services[name]; !ok {
+			svc.Stop()
+			log.Printf("stopped %s (removed from config)", name)
 		}
 	}
 
-	for _, l := range tail {
-		fmt.Println(l)
+	// Carry over existing running services; start new ones.
+	for _, name := range newSup.serviceKeys {
+		if existing, ok := old.services[name]; ok {
+			newSup.services[name] = existing
+		} else {
+			if err := newSup.services[name].Start(); err != nil {
+				log.Printf("failed to start %s: %v", name, err)
+			} else {
+				log.Printf("started %s (added to config)", name)
+			}
+		}
+	}
+
+	supervisorMu.Lock()
+	supervisor = newSup
+	supervisorMu.Unlock()
+	return nil
+}
+
+// --- Unix socket server ---
+
+func serveSocket() (net.Listener, error) {
+	os.Remove(socketPath)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen %s: %w", socketPath, err)
+	}
+	os.Chmod(socketPath, 0600)
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleConn(conn)
+		}
+	}()
+	return ln, nil
+}
+
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil && line == "" {
+		return
+	}
+	args := strings.Fields(strings.TrimSpace(line))
+	if len(args) == 0 {
+		return
+	}
+
+	w := bufio.NewWriter(conn)
+	defer w.Flush()
+
+	supervisorMu.RLock()
+	sup := supervisor
+	supervisorMu.RUnlock()
+
+	switch args[0] {
+	case "status":
+		if len(args) == 1 {
+			fmt.Fprintln(w, sup.Status())
+		} else {
+			if svc, ok := sup.services[args[1]]; ok {
+				fmt.Fprintln(w, svc.Status())
+			} else {
+				fmt.Fprintf(w, "ERROR: unknown service: %s\n", args[1])
+			}
+		}
+
+	case "start":
+		if len(args) < 2 {
+			fmt.Fprintln(w, "ERROR: usage: start <name>")
+			return
+		}
+		name := args[1]
+		svc, ok := sup.services[name]
+		if !ok {
+			fmt.Fprintf(w, "ERROR: unknown service: %s\n", name)
+			return
+		}
+		svc.mu.Lock()
+		svc.stopped = false
+		svc.mu.Unlock()
+		if err := svc.Start(); err != nil {
+			fmt.Fprintf(w, "ERROR: %v\n", err)
+			return
+		}
+		fmt.Fprintf(w, "started %s\n", name)
+
+	case "stop":
+		if len(args) < 2 {
+			fmt.Fprintln(w, "ERROR: usage: stop <name>")
+			return
+		}
+		name := args[1]
+		svc, ok := sup.services[name]
+		if !ok {
+			fmt.Fprintf(w, "ERROR: unknown service: %s\n", name)
+			return
+		}
+		svc.Stop()
+		fmt.Fprintf(w, "stopped %s\n", name)
+
+	case "restart":
+		if len(args) < 2 {
+			fmt.Fprintln(w, "ERROR: usage: restart <name>")
+			return
+		}
+		name := args[1]
+		svc, ok := sup.services[name]
+		if !ok {
+			fmt.Fprintf(w, "ERROR: unknown service: %s\n", name)
+			return
+		}
+		svc.Stop()
+		svc.mu.Lock()
+		svc.stopped = false
+		svc.mu.Unlock()
+		if err := svc.Start(); err != nil {
+			fmt.Fprintf(w, "ERROR: %v\n", err)
+			return
+		}
+		fmt.Fprintf(w, "restarted %s\n", name)
+
+	case "reload":
+		if err := reloadConfig(); err != nil {
+			fmt.Fprintf(w, "ERROR: %v\n", err)
+			return
+		}
+		fmt.Fprintln(w, "reloaded")
+
+	case "tail":
+		n := 20
+		name := ""
+		rest := args[1:]
+		for len(rest) > 0 {
+			if rest[0] == "-n" && len(rest) > 1 {
+				v, err := strconv.Atoi(rest[1])
+				if err != nil {
+					fmt.Fprintf(w, "ERROR: invalid line count: %s\n", rest[1])
+					return
+				}
+				n = v
+				rest = rest[2:]
+			} else {
+				name = rest[0]
+				rest = rest[1:]
+			}
+		}
+		if name == "" {
+			for _, sname := range sup.serviceKeys {
+				fmt.Fprintf(w, "=== %s ===\n", sname)
+				fmt.Fprintln(w, sup.Tail(sname, n))
+			}
+		} else {
+			fmt.Fprintln(w, sup.Tail(name, n))
+		}
+
+	default:
+		fmt.Fprintf(w, "ERROR: unknown command: %s\n", args[0])
+	}
+}
+
+// --- CLI client ---
+
+func dialDaemon(args []string) error {
+	conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("section3 is not running (cannot connect to %s)", socketPath)
+	}
+	defer conn.Close()
+
+	fmt.Fprintln(conn, strings.Join(args, " "))
+	conn.(*net.UnixConn).CloseWrite()
+
+	scanner := bufio.NewScanner(conn)
+	exitErr := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "ERROR: ") {
+			fmt.Fprintln(os.Stderr, line[7:])
+			exitErr = true
+		} else {
+			fmt.Println(line)
+		}
+	}
+	if exitErr {
+		os.Exit(1)
 	}
 	return nil
 }
 
-func TailAll(lines int) error {
-	for _, name := range supervisor.serviceKeys {
-		fmt.Printf("=== %s ===\n", name)
-		if err := Tail(name, lines); err != nil {
-			fmt.Printf("  (no log file)\n")
-		}
+// --- Daemon ---
+
+func runDaemon() {
+	// Single-instance guard: if we can connect, a daemon is already running.
+	if conn, err := net.DialTimeout("unix", socketPath, time.Second); err == nil {
+		conn.Close()
+		fmt.Fprintln(os.Stderr, "section3: already running")
+		os.Exit(1)
 	}
-	return nil
-}
 
-var supervisor *Supervisor
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "section3: failed to create log dir: %v\n", err)
+		os.Exit(1)
+	}
+	logFd, err := os.OpenFile(filepath.Join(logDir, "section3.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "section3: failed to open log: %v\n", err)
+		os.Exit(1)
+	}
+	log.SetOutput(logFd)
+	log.SetFlags(log.LstdFlags)
 
-func main() {
+	supervisorMu.Lock()
 	supervisor = NewSupervisor()
 	if err := supervisor.LoadConfig(); err != nil {
-		log.Fatal(err)
+		log.Fatalf("section3: failed to load config: %v", err)
+	}
+	supervisorMu.Unlock()
+
+	ln, err := serveSocket()
+	if err != nil {
+		log.Fatalf("section3: %v", err)
 	}
 
-	if len(os.Args) < 2 {
-		// Daemonize: use start-stop-daemon or nohup
-		binary, err := filepath.Abs(os.Args[0])
-		if err != nil {
-			log.Fatal(err)
+	log.Printf("section3: starting, pid %d", os.Getpid())
+	supervisor.StartAll()
+
+	term := make(chan os.Signal, 1)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(hup, syscall.SIGHUP)
+
+	for {
+		select {
+		case <-term:
+			log.Println("section3: shutting down...")
+			ln.Close()
+			os.Remove(socketPath)
+			supervisorMu.RLock()
+			sup := supervisor
+			supervisorMu.RUnlock()
+			sup.StopAll()
+			return
+
+		case <-hup:
+			log.Println("section3: reloading config...")
+			if err := reloadConfig(); err != nil {
+				log.Printf("section3: reload failed: %v", err)
+			}
 		}
-		cmd := exec.Command("nohup", binary, "--daemon")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = nil
-		cmd.Start()
-		fmt.Printf("section3: started as daemon (pid %d)\n", cmd.Process.Pid)
-		os.Exit(0)
 	}
+}
 
-	// --daemon flag: actually run the supervisor (child process after fork)
-	if os.Args[1] == "--daemon" {
-		// Kill any existing instance
-		if pidData, err := os.ReadFile(pidFile); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil {
-				syscall.Kill(pid, syscall.SIGTERM)
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
-		// Write our pid
-		os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
+// --- Entry point ---
 
-		// Ensure log directory exists
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "section3: failed to create log dir %s: %v\n", logDir, err)
-			os.Exit(1)
-		}
-		// Redirect logs to file in logDir
-		logFd, err := os.OpenFile(filepath.Join(logDir, "section3.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "section3: failed to open log: %v\n", err)
-			os.Exit(1)
-		}
-		log.SetOutput(logFd)
-		log.SetFlags(log.LstdFlags)
-		log.Printf("section3: daemon starting, pid %d", os.Getpid())
-		supervisor.StartAll()
-
-		term := make(chan os.Signal, 1)
-		hup := make(chan os.Signal, 1)
-		signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
-		signal.Notify(hup, syscall.SIGHUP)
-
-		for {
-			select {
-			case <-term:
-				log.Println("section3: shutting down...")
-				supervisor.StopAll()
-				return
-
-			case <-hup:
-				log.Println("section3: reloading config...")
-				newSup := NewSupervisor()
-				if err := newSup.LoadConfig(); err != nil {
-					log.Printf("section3: reload failed: %v", err)
-					continue
-				}
-
-				// Stop services removed from config
-				for name, svc := range supervisor.services {
-					if _, ok := newSup.services[name]; !ok {
-						svc.Stop()
-						log.Printf("section3: stopped %s (removed from config)", name)
-					}
-				}
-
-				// Start services added to config
-				for _, name := range newSup.serviceKeys {
-					if _, ok := supervisor.services[name]; !ok {
-						if err := newSup.services[name].Start(); err != nil {
-							log.Printf("section3: failed to start %s: %v", name, err)
-						} else {
-							log.Printf("section3: started %s (added from config)", name)
-						}
-					} else {
-						// Keep the existing running service
-						newSup.services[name] = supervisor.services[name]
-					}
-				}
-
-				supervisor = newSup
-			}
-		}
+func main() {
+	if len(os.Args) < 2 || os.Args[1] == "--daemon" {
+		runDaemon()
+		return
 	}
 
 	switch os.Args[1] {
-	case "status":
-		if len(os.Args) == 2 {
-			fmt.Println(supervisor.Status())
-		} else {
-			name := os.Args[2]
-			if svc, ok := supervisor.services[name]; ok {
-				fmt.Println(svc.Status())
-			} else {
-				fmt.Printf("unknown service: %s\n", name)
-				os.Exit(1)
-			}
-		}
-	case "start":
-		if len(os.Args) < 3 {
-			fmt.Println("usage: section3 start <name>")
-			os.Exit(2)
-		}
-		name := os.Args[2]
-		if svc, ok := supervisor.services[name]; ok {
-			if err := svc.Start(); err != nil {
-				fmt.Printf("failed to start %s: %v\n", name, err)
-				os.Exit(1)
-			}
-			fmt.Printf("started %s\n", name)
-		} else {
-			fmt.Printf("unknown service: %s\n", name)
-			os.Exit(1)
-		}
-	case "stop":
-		if len(os.Args) < 3 {
-			fmt.Println("usage: section3 stop <name>")
-			os.Exit(2)
-		}
-		name := os.Args[2]
-		if svc, ok := supervisor.services[name]; ok {
-			svc.Stop()
-			fmt.Printf("stopped %s\n", name)
-		} else {
-			fmt.Printf("unknown service: %s\n", name)
-			os.Exit(1)
-		}
-	case "restart":
-		if len(os.Args) < 3 {
-			fmt.Println("usage: section3 restart <name>")
-			os.Exit(2)
-		}
-		name := os.Args[2]
-		if svc, ok := supervisor.services[name]; ok {
-			svc.Stop()
-			time.Sleep(500 * time.Millisecond)
-			// Reset stopped so Start() will proceed
-			svc.mu.Lock()
-			svc.stopped = false
-			svc.mu.Unlock()
-			if err := svc.Start(); err != nil {
-				fmt.Printf("failed to restart %s: %v\n", name, err)
-				os.Exit(1)
-			}
-			fmt.Printf("restarted %s\n", name)
-		} else {
-			fmt.Printf("unknown service: %s\n", name)
-			os.Exit(1)
-		}
-	case "reload":
-		old := supervisor.services
-		supervisor = NewSupervisor()
-		if err := supervisor.LoadConfig(); err != nil {
-			fmt.Printf("reload failed: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Stop services not in new config
-		for name, svc := range old {
-			if _, ok := supervisor.services[name]; !ok {
-				svc.Stop()
-				log.Printf("stopped %s (removed from config)", name)
-			}
-		}
-
-		// Start new services
-		for _, name := range supervisor.serviceKeys {
-			if _, ok := old[name]; !ok {
-				supervisor.services[name].Start()
-				log.Printf("started %s (added from config)", name)
-			}
-		}
-
-		fmt.Println("reloaded")
-	case "tail":
-		lines := 20
-		name := ""
-		args := os.Args[2:]
-		for len(args) > 0 {
-			if args[0] == "-n" {
-				if len(args) < 2 {
-					fmt.Println("usage: section3 tail [-n <lines>] [name]")
-					os.Exit(2)
-				}
-				n, err := strconv.Atoi(args[1])
-				if err != nil {
-					fmt.Printf("invalid number: %s\n", args[1])
-					os.Exit(2)
-				}
-				lines = n
-				args = args[2:]
-			} else {
-				name = args[0]
-				args = args[1:]
-			}
-		}
-		var err error
-		if name == "" {
-			err = TailAll(lines)
-		} else {
-			err = Tail(name, lines)
-		}
-		if err != nil {
-			fmt.Printf("tail failed: %v\n", err)
-			os.Exit(1)
-		}
 	case "help", "-h", "--help":
 		fmt.Println(`section3 - service supervisor
 
 Commands:
-  section3               Start the supervisor (default when run without args)
+  section3               Start the supervisor daemon
   section3 status        Show status of all services
   section3 status <name> Show status of one service
   section3 start <name>  Start a service
@@ -594,7 +656,9 @@ Commands:
   section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
   section3 help          Show this help`)
 	default:
-		fmt.Printf("unknown command: %s\n", os.Args[1])
-		os.Exit(2)
+		if err := dialDaemon(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 }
