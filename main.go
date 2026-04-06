@@ -17,9 +17,12 @@ import (
 	"time"
 )
 
+var (
+	configPath = "/workspace/section3.yml"
+	logDir     = "/tmp/section3-logs"
+)
+
 const (
-	configPath   = "/workspace/section3.yml"
-	logDir       = "/tmp/section3-logs"
 	pidFile      = "/tmp/section3.pid"
 	maxBackoff   = 60 * time.Second
 	backoffMul   = 2
@@ -50,6 +53,8 @@ type Service struct {
 
 	mu         sync.Mutex
 	stopped    bool
+	running    bool          // true while process is alive
+	done       chan struct{}  // closed by wait() when process exits; nil until first Start()
 	crashCount int
 	backoff    time.Duration
 	startTime  time.Time
@@ -95,12 +100,10 @@ func (s *Supervisor) LoadConfig() error {
 }
 
 func (s *Service) OpenLog() error {
-	// Ensure log directory exists
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return err
 	}
 
-	// Check rotation
 	s.checkRotation()
 
 	f, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
@@ -152,34 +155,56 @@ func (s *Service) Start() error {
 		return err
 	}
 
+	done := make(chan struct{})
+
 	s.mu.Lock()
 	s.cmd = cmd
+	s.running = true
+	s.done = done
 	s.startTime = time.Now()
 	s.mu.Unlock()
 
-	go s.wait()
+	go s.wait(done)
 	return nil
 }
 
-func (s *Service) shouldRestart() bool {
-	if s.Restart == "never" {
+// shouldRestart returns whether the service should be restarted given its exit error.
+func (s *Service) shouldRestart(exitErr error) bool {
+	switch s.Restart {
+	case "never":
 		return false
+	case "on-crash":
+		return exitErr != nil // only restart on non-zero exit
+	default: // "always"
+		return true
 	}
-	return true
 }
 
-func (s *Service) wait() {
+// wait is the sole goroutine that calls cmd.Wait(). It owns the process lifecycle.
+func (s *Service) wait(done chan struct{}) {
+	defer close(done)
+
 	err := s.cmd.Wait()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.running = false
 
-	if s.stopped || s.cmd == nil {
+	if s.stopped {
+		if s.logFile != nil {
+			s.logFile.Close()
+			s.logFile = nil
+		}
+		s.mu.Unlock()
 		return
 	}
 
-	if !s.shouldRestart() {
-		log.Printf("[%s] exited: %v (not restarting, restart=never)", s.Name, err)
+	if !s.shouldRestart(err) {
+		log.Printf("[%s] exited: %v (not restarting, restart=%s)", s.Name, err, s.Restart)
+		if s.logFile != nil {
+			s.logFile.Close()
+			s.logFile = nil
+		}
+		s.mu.Unlock()
 		return
 	}
 
@@ -193,21 +218,31 @@ func (s *Service) wait() {
 		}
 	}
 	s.crashCount++
-
-	log.Printf("[%s] exited: %v (restarting in %v, crash #%d)", s.Name, err, s.backoff, s.crashCount)
+	backoff := s.backoff
+	crashCount := s.crashCount
 
 	if s.logFile != nil {
 		s.logFile.Close()
 		s.logFile = nil
 	}
 
-	time.Sleep(s.backoff)
+	s.mu.Unlock() // release before sleeping and restarting
 
-	if s.stopped {
+	log.Printf("[%s] exited: %v (restarting in %v, crash #%d)", s.Name, err, backoff, crashCount)
+
+	time.Sleep(backoff)
+
+	s.mu.Lock()
+	stopped := s.stopped
+	s.mu.Unlock()
+
+	if stopped {
 		return
 	}
 
-	s.Start()
+	if err := s.Start(); err != nil {
+		log.Printf("[%s] restart failed: %v", s.Name, err)
+	}
 }
 
 func (s *Service) Stop() error {
@@ -216,6 +251,7 @@ func (s *Service) Stop() error {
 	s.backoff = 0
 	s.crashCount = 0
 	cmd := s.cmd
+	done := s.done
 	s.mu.Unlock()
 
 	if cmd == nil || cmd.Process == nil {
@@ -224,24 +260,24 @@ func (s *Service) Stop() error {
 
 	syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 
-	done := make(chan struct{})
-	go func() {
-		cmd.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		if cmd.Process != nil {
-			cmd.Process.Kill()
+	if done != nil {
+		select {
+		case <-done:
+			// wait() exited cleanly
+		case <-time.After(5 * time.Second):
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			<-done // wait for wait() to finish after kill
 		}
 	}
 
+	s.mu.Lock()
 	if s.logFile != nil {
 		s.logFile.Close()
 		s.logFile = nil
 	}
+	s.mu.Unlock()
 
 	return nil
 }
@@ -250,7 +286,7 @@ func (s *Service) Status() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.cmd == nil || s.cmd.Process == nil {
+	if !s.running {
 		if s.lastCrash.IsZero() {
 			return fmt.Sprintf("%-12s stopped  (never started)", s.Name)
 		}
@@ -376,13 +412,51 @@ func main() {
 		log.Printf("section3: daemon starting, pid %d", os.Getpid())
 		supervisor.StartAll()
 
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-		<-sig
+		term := make(chan os.Signal, 1)
+		hup := make(chan os.Signal, 1)
+		signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
+		signal.Notify(hup, syscall.SIGHUP)
 
-		log.Println("section3: shutting down...")
-		supervisor.StopAll()
-		return
+		for {
+			select {
+			case <-term:
+				log.Println("section3: shutting down...")
+				supervisor.StopAll()
+				return
+
+			case <-hup:
+				log.Println("section3: reloading config...")
+				newSup := NewSupervisor()
+				if err := newSup.LoadConfig(); err != nil {
+					log.Printf("section3: reload failed: %v", err)
+					continue
+				}
+
+				// Stop services removed from config
+				for name, svc := range supervisor.services {
+					if _, ok := newSup.services[name]; !ok {
+						svc.Stop()
+						log.Printf("section3: stopped %s (removed from config)", name)
+					}
+				}
+
+				// Start services added to config
+				for _, name := range newSup.serviceKeys {
+					if _, ok := supervisor.services[name]; !ok {
+						if err := newSup.services[name].Start(); err != nil {
+							log.Printf("section3: failed to start %s: %v", name, err)
+						} else {
+							log.Printf("section3: started %s (added from config)", name)
+						}
+					} else {
+						// Keep the existing running service
+						newSup.services[name] = supervisor.services[name]
+					}
+				}
+
+				supervisor = newSup
+			}
+		}
 	}
 
 	switch os.Args[1] {
@@ -436,6 +510,10 @@ func main() {
 		if svc, ok := supervisor.services[name]; ok {
 			svc.Stop()
 			time.Sleep(500 * time.Millisecond)
+			// Reset stopped so Start() will proceed
+			svc.mu.Lock()
+			svc.stopped = false
+			svc.mu.Unlock()
 			if err := svc.Start(); err != nil {
 				fmt.Printf("failed to restart %s: %v\n", name, err)
 				os.Exit(1)
