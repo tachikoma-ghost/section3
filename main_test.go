@@ -299,6 +299,8 @@ func TestStatus(t *testing.T) {
 
 func TestLoadConfig(t *testing.T) {
 	yml := `
+defaults:
+  dir: /custom/default/dir
 services:
   worker:
     command: /usr/bin/worker
@@ -306,6 +308,8 @@ services:
   web:
     command: /usr/bin/web serve
     restart: always
+  no-dir-service:
+    command: /usr/bin/something
 `
 	f, err := os.CreateTemp(t.TempDir(), "section3-*.yml")
 	if err != nil {
@@ -323,9 +327,10 @@ services:
 		t.Fatal(err)
 	}
 
-	if len(sup.services) != 2 {
-		t.Fatalf("expected 2 services, got %d", len(sup.services))
+	if len(sup.services) != 3 {
+		t.Fatalf("expected 3 services, got %d", len(sup.services))
 	}
+
 	web := sup.services["web"]
 	if web == nil {
 		t.Fatal("missing 'web'")
@@ -336,7 +341,16 @@ services:
 	if web.Restart != "always" {
 		t.Errorf("web.Restart = %q", web.Restart)
 	}
-	if sup.serviceKeys[0] != "web" || sup.serviceKeys[1] != "worker" {
+
+	noDir := sup.services["no-dir-service"]
+	if noDir == nil {
+		t.Fatal("missing 'no-dir-service'")
+	}
+	if noDir.Dir != "/custom/default/dir" {
+		t.Errorf("no-dir-service.Dir = %q, want /custom/default/dir", noDir.Dir)
+	}
+
+	if sup.serviceKeys[0] != "no-dir-service" || sup.serviceKeys[1] != "web" || sup.serviceKeys[2] != "worker" {
 		t.Errorf("serviceKeys not sorted: %v", sup.serviceKeys)
 	}
 }
