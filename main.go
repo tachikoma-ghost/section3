@@ -41,6 +41,7 @@ var (
 // --- Types ---
 
 type Config struct {
+	Defaults ServiceConfig            `yaml:"defaults"`
 	Services map[string]ServiceConfig `yaml:"services"`
 }
 
@@ -97,6 +98,12 @@ func (s *Supervisor) LoadConfig() error {
 
 	s.serviceKeys = nil
 	for name, sc := range cfg.Services {
+		if sc.Dir == "" {
+			sc.Dir = cfg.Defaults.Dir
+		}
+		if sc.Restart == "" {
+			sc.Restart = cfg.Defaults.Restart
+		}
 		s.services[name] = &Service{
 			Name:    name,
 			Command: sc.Command,

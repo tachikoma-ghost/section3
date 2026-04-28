@@ -6,11 +6,16 @@ services:
     command: /home/node/.local/bin/signalshell serve
     restart: always
 
+  stt-server:
+    command: python3 /workspace/src/voice/stt_server.py small 8766
+    restart: always
+
   voice:
     command: /workspace/src/voice/bin/voice -config /workspace/src/voice/config.yaml
     restart: always
     depends_on:
       - signalshell
+      - stt-server
 
   telegram:
     command: /workspace/src/telegram/bin/telegram -config /workspace/src/telegram/config.yaml
