@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -384,6 +385,43 @@ func TestLogRotation(t *testing.T) {
 	}
 	if fi.Size() != 0 {
 		t.Errorf("new log should be empty after rotation, got size %d", fi.Size())
+	}
+}
+
+func TestServiceStartUsesDir(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "test.log")
+
+	svc := &Service{
+		Name:    "test",
+		Command: "sleep 60",
+		Dir:     dir,
+		Restart: "never",
+		logPath: logPath,
+	}
+
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Stop()
+
+	svc.mu.Lock()
+	pid := svc.cmd.Process.Pid
+	svc.mu.Unlock()
+
+	cwdLink := filepath.Join(dir, "proc_cwd_test")
+	if err := os.Symlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"), cwdLink); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(cwdLink)
+
+	realCwd, err := filepath.EvalSymlinks(cwdLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if realCwd != dir {
+		t.Errorf("process cwd = %q, want %q", realCwd, dir)
 	}
 }
 
