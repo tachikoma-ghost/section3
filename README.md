@@ -1,3 +1,5 @@
+<img src="assets/icon.png" width="80" align="right" />
+
 # Section3 — Service Supervisor
 
 Minimal Go service supervisor with YAML config. Fork+exec services, restart on crash, handle logs with rotation.
