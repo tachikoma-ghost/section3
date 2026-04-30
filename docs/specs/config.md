@@ -1,4 +1,4 @@
-<!-- Ops -->
+<!-- L4: Spec -->
 # Config Schema
 
 Full YAML format for `/workspace/section3.yml`.

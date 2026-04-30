@@ -39,7 +39,7 @@ Per-service log files at `/tmp/section3-logs/<name>.log`. Rotation at 1MB, keeps
 ## Key decisions
 
 - **Process groups** — each service in its own process group so stopping a service kills all its children
-- **Restart backoff** — exponential (1s → 2s → 4s → ... → max 60s), resets on successful start
+- **Restart backoff** — exponential (1s → 2s → 4s → 8s → ... → max 60s), resets on successful start
 - **Config reload** — `section3 reload` re-reads `section3.yml` without restarting already-running services; new services are started, removed services are stopped, existing services are carried over
 - **Alphabetical startup** — services start in sorted order (not dependency order)
 - **Per-service working directory** — each service can specify `dir:` to set its working directory; services without explicit `dir` use `defaults.dir`
@@ -51,3 +51,7 @@ Per-service log files at `/tmp/section3-logs/<name>.log`. Rotation at 1MB, keeps
 - Supervisor loop: `runDaemon()` in `src/section3/main.go`
 - Log rotation: `Service.OpenLog()`, `Service.checkRotation()` in `src/section3/main.go`
 - Socket CLI: `serveSocket()`, `handleConn()` in `src/section3/main.go`
+
+## Contributing
+
+See [DEVELOPMENT.md](../../DEVELOPMENT.md) for contributor documentation (architecture walkthrough, testing, building).
