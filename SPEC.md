@@ -6,16 +6,21 @@ A minimal Go service supervisor for Tachikoma. Fork+exec services from YAML conf
 
 - **Binary name:** `section3`
 - **Config:** YAML file at `/workspace/section3.yml`
-- **Log location:** `/var/log/section3/<name>.log` (one file per service, rotated by supervisor)
+- **Log location:** `/tmp/section3-logs/<name>.log` (one file per service, rotated by supervisor)
 - **Entry point:** runs in foreground as PID 1 of the container
 
 ## Configuration
 
 ```yaml
+defaults:
+  dir: /workspace           # default working directory
+  restart: always           # default restart policy
+
 services:
   <name>:
     command: /path/to/executable args...
-    restart: always | never
+    dir: /workspace          # working directory (optional)
+    restart: always | never | on-crash
     depends_on:
       - other-service
 ```
@@ -37,7 +42,7 @@ services:
 ## Log Handling
 
 - Capture stdout + stderr of each service
-- Write to `/var/log/section3/<name>.log`
+- Write to `/tmp/section3-logs/<name>.log`
 - Rotate when file exceeds 1MB (rename to `<name>.log.1`, start new `<name>.log`)
 - Keep last 5 rotated files per service
 

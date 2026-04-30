@@ -16,16 +16,23 @@ make build
 Edit `/workspace/section3.yml`:
 
 ```yaml
+defaults:
+  dir: /workspace
+  restart: always
+
 services:
   signalshell:
     command: /home/node/.local/bin/signalshell serve
-    restart: always
 
   voice:
     command: /workspace/src/voice/bin/voice -config /workspace/src/voice/config.yaml
-    restart: always
     depends_on:
       - signalshell
+
+  one-shot:
+    command: /bin/once.sh
+    restart: never
+    dir: /tmp
 ```
 
 ### Run
@@ -55,12 +62,13 @@ section3 help          Show this help
 
 - `always` — restart on any exit (default)
 - `never` — do not restart
+- `on-crash` — restart only on non-zero exit
 
 ## Log Location
 
-Logs go to `/var/log/section3/<name>.log`
+Logs go to `/tmp/section3-logs/<name>.log`
 
-Log rotation: files rotate at 1MB, keeping last 5 versions (`.log.1` ... `.log.5`).
+Log rotation: files rotate at 1MB, keeping last 5 versions (`<name>.log.1` ... `<name>.log.5`).
 
 ## Tachikoma Integration
 
