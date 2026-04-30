@@ -1,5 +1,5 @@
-<!-- Reference -->
-# Section3 Config Schema
+<!-- Ops -->
+# Config Schema
 
 Full YAML format for `/workspace/section3.yml`.
 

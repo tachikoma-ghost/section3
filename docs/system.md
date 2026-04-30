@@ -17,7 +17,7 @@ Service supervisor for the Tachikoma workspace. Reads a YAML config, starts all 
 
 ## Reference
 
-- [Config schema](reference/config-schema.md) — full YAML config format with all options
+- [Config schema](ops/config.md) — YAML config format with all options
 
 ## Constraints and non-goals
 

@@ -27,7 +27,7 @@ section3 help          Show help
 ```
 
 ### Config file
-`/workspace/section3.yml` — see [config schema](../reference/config-schema.md) for full format.
+`/workspace/section3.yml` — see [config schema](../ops/config.md) for full format.
 
 ### Log files
 Per-service log files at `/tmp/section3-logs/<name>.log`. Rotation at 1MB, keeps last 5 files (`<name>.log.1` ... `<name>.log.5`).
