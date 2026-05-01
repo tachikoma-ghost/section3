@@ -54,4 +54,4 @@ Per-service log files at `/tmp/section3-logs/<name>.log`. Rotation at 1MB, keeps
 
 ## Contributing
 
-See [DEVELOPMENT.md](../../DEVELOPMENT.md) for contributor documentation (architecture walkthrough, testing, building).
+See [development](../ops/development.md) for contributor documentation (architecture walkthrough, testing, building).

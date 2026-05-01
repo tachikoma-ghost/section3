@@ -1,4 +1,5 @@
-# Section3 — Development
+<!-- Ops -->
+# Development
 
 ## Architecture
 
@@ -29,7 +30,7 @@ Each service runs in its own process group (`Setpgid: true`). This allows clean 
 
 ## Config
 
-Full schema at [docs/specs/config.md](specs/config.md).
+Full schema at [config schema](../specs/config.md).
 
 ## Running Tests
 

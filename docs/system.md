@@ -15,6 +15,10 @@ Service supervisor for the Tachikoma workspace. Reads a YAML config, starts all 
 
 - [section3](containers/section3.md) — Go binary: config loader, process manager, log rotator, CLI
 
+## Ops
+
+- [Development](../ops/development.md) — architecture walkthrough, testing, building
+
 ## Specs
 
 - [Config schema](specs/config.md) — YAML config format with all options
