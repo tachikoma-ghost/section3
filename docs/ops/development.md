@@ -24,9 +24,10 @@ Each service runs in its own process group (`Setpgid: true`). This allows clean 
 
 ## Log Rotation
 
-- `checkRotation()` called on each log open, checks if file exceeds 1MB
-- Rotation: file → file.1, file.N → file.N+1, file.5 deleted
-- Keeps last 5 rotated files
+- Service output is piped through a `rotatingWriter` owned by the supervisor; the child never holds the log fd, so rotation works while the service runs
+- `rotatingWriter.Write` rotates before any write that would push the file past 1MB: file → file.1, file.N → file.N+1, file.5 overwritten
+- Keeps last 5 rotated files; rename/reopen errors are logged, with a 30s cooldown so a persistent failure can't recurse through the daemon's own log
+- The writer survives crash restarts and is closed on `Stop()` or a no-restart exit
 
 ## Config
 

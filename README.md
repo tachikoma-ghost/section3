@@ -68,7 +68,7 @@ section3 help          Show this help
 
 Logs go to `/tmp/section3-logs/<name>.log`
 
-Log rotation: files rotate at 1MB, keeping last 5 versions (`<name>.log.1` ... `<name>.log.5`).
+Output is piped through the supervisor, so logs rotate at 1MB even while a service is running, keeping last 5 versions (`<name>.log.1` ... `<name>.log.5`). The daemon's own `section3.log` rotates the same way.
 
 ## Tachikoma Integration
 

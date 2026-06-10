@@ -62,12 +62,12 @@ services:
 
 ## Log files
 
-Log files are written to `/tmp/section3-logs/<service-name>.log`. When a log file exceeds 1MB, it is rotated:
+Log files are written to `/tmp/section3-logs/<service-name>.log`. Service output is piped through the supervisor, so rotation happens as soon as a write would push the file past 1MB — including while the service is running:
 
 - `<name>.log` → `<name>.log.1`
 - `<name>.log.1` → `<name>.log.2`
 - ...
 - `<name>.log.4` → `<name>.log.5`
-- `<name>.log.5` is deleted
+- `<name>.log.5` is overwritten
 
-A maximum of 5 rotated files are kept per service.
+A maximum of 5 rotated files are kept per service, plus the active log. The supervisor's own `section3.log` rotates the same way.

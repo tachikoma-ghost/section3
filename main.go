@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"gopkg.in/yaml.v3"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -25,11 +27,12 @@ var (
 )
 
 const (
-	maxBackoff   = 60 * time.Second
-	backoffMul   = 2
-	startStagger = 100 * time.Millisecond
-	maxLogSize   = 1 * 1024 * 1024 // 1MB
-	maxLogFiles  = 5
+	maxBackoff          = 60 * time.Second
+	backoffMul          = 2
+	startStagger        = 100 * time.Millisecond
+	maxLogSize          = 1 * 1024 * 1024 // 1MB
+	maxLogBackups       = 5               // rotated copies kept per log (.1 .. .5)
+	rotateRetryCooldown = 30 * time.Second
 )
 
 // supervisor is the live instance; swapped atomically by reloadConfig.
@@ -58,13 +61,14 @@ type Service struct {
 	Dir     string
 	Restart string
 	cmd     *exec.Cmd
-	logFile *os.File
+	logw    *rotatingWriter
 	logPath string
 
 	mu         sync.Mutex
 	stopped    bool
-	running    bool         // true while process is alive
+	running    bool          // true while process is alive
 	done       chan struct{} // closed by wait() when process exits
+	copyDone   chan struct{} // closed when the log copy goroutine finishes
 	crashCount int
 	backoff    time.Duration
 	startTime  time.Time
@@ -119,71 +123,198 @@ func (s *Supervisor) LoadConfig() error {
 
 // --- Log ---
 
-func (s *Service) OpenLog() error {
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return err
-	}
-	s.checkRotation()
+// rotatingWriter is an append-only log writer that rotates the file once it
+// reaches maxSize, keeping maxBackups renamed copies (.1 is newest). Service
+// output is piped through it by the supervisor — the child never holds the
+// log fd itself, which is what makes rotation possible while it runs.
+type rotatingWriter struct {
+	path       string
+	maxSize    int64
+	maxBackups int
 
-	f, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	mu       sync.Mutex
+	f        *os.File
+	size     int64
+	lastFail time.Time
+}
+
+func newRotatingWriter(path string) (*rotatingWriter, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, err
+	}
+	w := &rotatingWriter{path: path, maxSize: maxLogSize, maxBackups: maxLogBackups}
+	if err := w.open(); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (w *rotatingWriter) open() error {
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	s.logFile = f
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	w.f = f
+	w.size = fi.Size()
 	return nil
 }
 
-func (s *Service) checkRotation() {
-	fi, err := os.Stat(s.logPath)
-	if err != nil || fi.Size() < maxLogSize {
+func (w *rotatingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	var rotErrs []error
+	if w.f == nil && time.Since(w.lastFail) >= rotateRetryCooldown {
+		if err := w.open(); err != nil {
+			w.lastFail = time.Now()
+			rotErrs = append(rotErrs, err)
+		}
+	}
+	if w.f != nil && w.size > 0 && w.size+int64(len(p)) > w.maxSize {
+		rotErrs = append(rotErrs, w.rotateLocked()...)
+	}
+	var n int
+	var err error
+	if w.f == nil {
+		err = fmt.Errorf("log %s is not open", w.path)
+	} else {
+		n, err = w.f.Write(p)
+		w.size += int64(n)
+	}
+	w.mu.Unlock()
+
+	// Logged after unlock: the daemon's own log is a rotatingWriter, so
+	// logging while holding the lock would deadlock on re-entry.
+	for _, e := range rotErrs {
+		log.Printf("log rotation %s: %v", w.path, e)
+	}
+	return n, err
+}
+
+// rotateLocked shifts path -> .1 -> .2 ... and reopens a fresh file. On any
+// failure it backs off for rotateRetryCooldown so a persistent error cannot
+// recurse through the daemon's own log writer.
+func (w *rotatingWriter) rotateLocked() []error {
+	if time.Since(w.lastFail) < rotateRetryCooldown {
+		return nil
+	}
+	var errs []error
+	w.f.Close()
+	w.f = nil
+	for i := w.maxBackups - 1; i >= 1; i-- {
+		old := fmt.Sprintf("%s.%d", w.path, i)
+		if _, err := os.Stat(old); err != nil {
+			continue
+		}
+		if err := os.Rename(old, fmt.Sprintf("%s.%d", w.path, i+1)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := os.Rename(w.path, w.path+".1"); err != nil {
+		errs = append(errs, err)
+	}
+	if err := w.open(); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		w.lastFail = time.Now()
+	}
+	return errs
+}
+
+func (w *rotatingWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f == nil {
+		return nil
+	}
+	err := w.f.Close()
+	w.f = nil
+	return err
+}
+
+// drainAndClose gives the log copy goroutine a moment to flush the last
+// output, then closes the writer.
+func drainAndClose(w *rotatingWriter, copyDone chan struct{}) {
+	if w == nil {
 		return
 	}
-	for i := maxLogFiles - 1; i >= 1; i-- {
-		os.Rename(fmt.Sprintf("%s.%d", s.logPath, i), fmt.Sprintf("%s.%d", s.logPath, i+1))
+	if copyDone != nil {
+		select {
+		case <-copyDone:
+		case <-time.After(time.Second):
+		}
 	}
-	os.Rename(s.logPath, s.logPath+".1")
+	w.Close()
 }
 
 // --- Service lifecycle ---
 
+// Start holds s.mu for its full duration so concurrent calls (socket command
+// racing the crash-restart loop) cannot double-spawn the process.
 func (s *Service) Start() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.stopped {
-		s.mu.Unlock()
 		return fmt.Errorf("service is stopped")
 	}
 	if s.running {
-		s.mu.Unlock()
 		return fmt.Errorf("already running")
 	}
-	s.mu.Unlock()
 
-	if err := s.OpenLog(); err != nil {
+	// The writer survives crash restarts; Stop() closes and clears it.
+	if s.logw == nil {
+		w, err := newRotatingWriter(s.logPath)
+		if err != nil {
+			return err
+		}
+		s.logw = w
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
 		return err
 	}
 
 	cmd := exec.Command("/bin/sh", "-c", s.Command)
-	cmd.Stdout = s.logFile
-	cmd.Stderr = s.logFile
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 	if s.Dir != "" {
 		cmd.Dir = s.Dir
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
+		pw.Close()
+		pr.Close()
 		return err
 	}
+	pw.Close() // the child holds its own copy of the write end
+
+	copyDone := make(chan struct{})
+	logw := s.logw
+	go func() {
+		defer close(copyDone)
+		defer pr.Close()
+		// ErrClosed just means the writer was closed by Stop() while a
+		// straggling descendant still held the pipe.
+		if _, err := io.Copy(logw, pr); err != nil && !errors.Is(err, os.ErrClosed) {
+			log.Printf("[%s] log copy: %v", s.Name, err)
+		}
+	}()
 
 	done := make(chan struct{})
-
-	s.mu.Lock()
 	s.cmd = cmd
 	s.running = true
 	s.done = done
+	s.copyDone = copyDone
 	s.startTime = time.Now()
-	s.mu.Unlock()
 
-	go s.wait(done)
+	go s.wait(cmd, done)
 	return nil
 }
 
@@ -198,30 +329,25 @@ func (s *Service) shouldRestart(exitErr error) bool {
 	}
 }
 
-func (s *Service) wait(done chan struct{}) {
+func (s *Service) wait(cmd *exec.Cmd, done chan struct{}) {
 	defer close(done)
 
-	err := s.cmd.Wait()
+	err := cmd.Wait()
 
 	s.mu.Lock()
 	s.running = false
 
 	if s.stopped {
-		if s.logFile != nil {
-			s.logFile.Close()
-			s.logFile = nil
-		}
-		s.mu.Unlock()
+		s.mu.Unlock() // Stop() owns log cleanup
 		return
 	}
 
 	if !s.shouldRestart(err) {
 		log.Printf("[%s] exited: %v (not restarting, restart=%s)", s.Name, err, s.Restart)
-		if s.logFile != nil {
-			s.logFile.Close()
-			s.logFile = nil
-		}
+		logw, copyDone := s.logw, s.copyDone
+		s.logw = nil
 		s.mu.Unlock()
+		drainAndClose(logw, copyDone)
 		return
 	}
 
@@ -237,11 +363,6 @@ func (s *Service) wait(done chan struct{}) {
 	s.crashCount++
 	backoff := s.backoff
 	crashCount := s.crashCount
-
-	if s.logFile != nil {
-		s.logFile.Close()
-		s.logFile = nil
-	}
 
 	s.mu.Unlock()
 
@@ -268,32 +389,27 @@ func (s *Service) Stop() error {
 	s.crashCount = 0
 	cmd := s.cmd
 	done := s.done
+	logw := s.logw
+	copyDone := s.copyDone
+	s.logw = nil
 	s.mu.Unlock()
 
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
+	if cmd != nil && cmd.Process != nil {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 
-	syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-
-	if done != nil {
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			if cmd.Process != nil {
-				cmd.Process.Kill()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				// Kill the whole group: a lone Process.Kill leaves
+				// grandchildren alive, still holding the log pipe.
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				<-done
 			}
-			<-done
 		}
 	}
 
-	s.mu.Lock()
-	if s.logFile != nil {
-		s.logFile.Close()
-		s.logFile = nil
-	}
-	s.mu.Unlock()
-
+	drainAndClose(logw, copyDone)
 	return nil
 }
 
@@ -345,19 +461,30 @@ func (s *Supervisor) Tail(name string, n int) string {
 	if !ok {
 		return fmt.Sprintf("ERROR: unknown service: %s", name)
 	}
-	f, err := os.Open(svc.logPath)
-	if err != nil {
-		return "(no log file)"
-	}
-	defer f.Close()
-
+	// Include the newest backup so tail stays useful right after a rotation.
 	var lines []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-		if len(lines) > n {
-			lines = lines[len(lines)-n:]
+	found := false
+	for _, p := range []string{svc.logPath + ".1", svc.logPath} {
+		f, err := os.Open(p)
+		if err != nil {
+			continue
 		}
+		found = true
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			lines = append(lines, scanner.Text())
+			if len(lines) > n {
+				lines = lines[len(lines)-n:]
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			lines = append(lines, fmt.Sprintf("(log read error: %v)", err))
+		}
+		f.Close()
+	}
+	if !found {
+		return "(no log file)"
 	}
 	return strings.Join(lines, "\n")
 }
@@ -587,16 +714,12 @@ func runDaemon() {
 		os.Exit(1)
 	}
 
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "section3: failed to create log dir: %v\n", err)
-		os.Exit(1)
-	}
-	logFd, err := os.OpenFile(filepath.Join(logDir, "section3.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	logw, err := newRotatingWriter(filepath.Join(logDir, "section3.log"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "section3: failed to open log: %v\n", err)
 		os.Exit(1)
 	}
-	log.SetOutput(logFd)
+	log.SetOutput(logw)
 	log.SetFlags(log.LstdFlags)
 
 	supervisorMu.Lock()

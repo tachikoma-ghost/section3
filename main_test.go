@@ -356,35 +356,129 @@ services:
 	}
 }
 
-func TestLogRotation(t *testing.T) {
+func TestRotatingWriter(t *testing.T) {
 	dir := t.TempDir()
-
-	origLogDir := logDir
-	logDir = dir
-	t.Cleanup(func() { logDir = origLogDir })
-
-	logPath := filepath.Join(dir, "svc.log")
-	big := bytes.Repeat([]byte("a"), maxLogSize+1)
-	if err := os.WriteFile(logPath, big, 0644); err != nil {
+	path := filepath.Join(dir, "x.log")
+	w := &rotatingWriter{path: path, maxSize: 100, maxBackups: 2}
+	if err := w.open(); err != nil {
 		t.Fatal(err)
 	}
+	defer w.Close()
 
-	svc := &Service{Name: "svc", Command: "true", Restart: "never", logPath: logPath}
-	if err := svc.OpenLog(); err != nil {
-		t.Fatal(err)
+	// 6 writes of 60 bytes at a 100-byte cap: every write after the first
+	// triggers a rotation.
+	line := bytes.Repeat([]byte("a"), 60)
+	for i := 0; i < 6; i++ {
+		if _, err := w.Write(line); err != nil {
+			t.Fatal(err)
+		}
 	}
-	svc.logFile.Close()
 
-	if _, err := os.Stat(logPath + ".1"); os.IsNotExist(err) {
-		t.Error("expected rotated log at " + logPath + ".1")
-	}
-
-	fi, err := os.Stat(logPath)
+	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Size() != 0 {
-		t.Errorf("new log should be empty after rotation, got size %d", fi.Size())
+	if fi.Size() != 60 {
+		t.Errorf("active log size = %d, want 60", fi.Size())
+	}
+	for _, suffix := range []string{".1", ".2"} {
+		if _, err := os.Stat(path + suffix); err != nil {
+			t.Errorf("expected backup %s%s: %v", path, suffix, err)
+		}
+	}
+	if _, err := os.Stat(path + ".3"); err == nil {
+		t.Errorf("backup .3 exists; maxBackups=2 should have pruned it")
+	}
+}
+
+// TestRotatingWriterExistingOversized covers the pre-existing case: a log
+// already past the cap (e.g. written by an older section3) rotates on the
+// first write rather than growing further.
+func TestRotatingWriterExistingOversized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.log")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), 200), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &rotatingWriter{path: path, maxSize: 100, maxBackups: 2}
+	if err := w.open(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if _, err := w.Write([]byte("hello\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Errorf("expected oversized log rotated to .1: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello\n" {
+		t.Errorf("active log = %q, want only the new write", data)
+	}
+}
+
+// TestServiceLogRotatesWithoutRestart is the regression test for the old
+// design, where rotation only ever happened on service (re)start.
+func TestServiceLogRotatesWithoutRestart(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "svc.log")
+	w := &rotatingWriter{path: logPath, maxSize: 256, maxBackups: 8}
+	if err := w.open(); err != nil {
+		t.Fatal(err)
+	}
+
+	// One run, no restarts, ~1.5KB of output: must rotate several times.
+	svc := &Service{
+		Name:    "svc",
+		Command: "i=0; while [ $i -lt 64 ]; do echo abcdefghijklmnopqrstuvw; i=$((i+1)); done",
+		Restart: "never",
+		logPath: logPath,
+		logw:    w,
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Stop()
+
+	// The no-restart exit path drains the pipe and clears logw; wait for it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		svc.mu.Lock()
+		finished := !svc.running && svc.logw == nil
+		svc.mu.Unlock()
+		if finished {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("service did not finish within 5s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if _, err := os.Stat(logPath + ".1"); err != nil {
+		t.Fatalf("log was not rotated during a single run: %v", err)
+	}
+
+	// No output may be lost across the rotated files: 64 lines total.
+	total := 0
+	for _, p := range []string{logPath, logPath + ".1", logPath + ".2", logPath + ".3", logPath + ".4", logPath + ".5"} {
+		data, err := os.ReadFile(p)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += bytes.Count(data, []byte("\n"))
+	}
+	if total != 64 {
+		t.Errorf("lines across all log files = %d, want 64 (output lost or duplicated)", total)
 	}
 }
 

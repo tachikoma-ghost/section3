@@ -41,10 +41,11 @@ services:
 
 ## Log Handling
 
-- Capture stdout + stderr of each service
+- Capture stdout + stderr of each service via a pipe through the supervisor
 - Write to `/tmp/section3-logs/<name>.log`
-- Rotate when file exceeds 1MB (rename to `<name>.log.1`, start new `<name>.log`)
+- Rotate when file would exceed 1MB (rename to `<name>.log.1`, start new `<name>.log`) — works mid-run, no restart needed
 - Keep last 5 rotated files per service
+- The daemon's own `section3.log` rotates by the same rules
 
 ## Commands
 
