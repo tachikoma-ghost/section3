@@ -96,12 +96,39 @@ Logs go to `/tmp/section3-logs/<name>.log`
 
 Output is piped through the supervisor, so logs rotate at 1MB even while a service is running, keeping last 5 versions (`<name>.log.1` ... `<name>.log.5`). The daemon's own `section3.log` rotates the same way.
 
-## Tachikoma Integration
+## Docker
 
-In `/workspace/init.sh`:
+section3 works as the container entrypoint, supervising everything inside:
+
+```dockerfile
+RUN curl -fsSL https://signalshell.com/install-section3 | sh
+COPY section3.yml /workspace/section3.yml
+ENTRYPOINT ["/usr/local/bin/section3"]
+```
+
+With docker-compose:
+
+```yaml
+services:
+  app:
+    build: .
+    init: true
+```
+
+Use `init: true` (or `docker run --init`): section3 reaps its direct
+children, but if a service forks and dies, the orphaned grandchildren
+reparent to PID 1 — tini handles those.
+
+Lifecycle maps onto Docker naturally:
+- `docker stop` → SIGTERM → section3 stops all services gracefully, then exits
+- `docker kill -s HUP <ctr>` or `docker exec <ctr> section3 reload` → config reload
+- `docker exec <ctr> section3 status` → service status from outside
+
+Alternatively, from an entrypoint script, `exec` it so signals reach the
+supervisor directly:
 ```bash
 #!/bin/bash
-exec /workspace/src/section3/bin/section3
+exec /usr/local/bin/section3
 ```
 
 ## Files
