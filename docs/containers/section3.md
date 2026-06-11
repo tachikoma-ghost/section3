@@ -49,7 +49,7 @@ public key embedded in `selfupdate.go`, and replaces itself atomically.
 ## Key decisions
 
 - **Process groups** — each service in its own process group so stopping a service kills all its children
-- **Restart backoff** — exponential (1s → 2s → 4s → 8s → ... → max 60s), resets on successful start
+- **Restart backoff** — exponential (1s → 2s → 4s → 8s → ... → max 60s). Resets only on explicit `stop`/`restart`; a long healthy run does not reset it, so the first crash after weeks of uptime still waits the previously accumulated backoff
 - **Config reload** — `section3 reload` re-reads `section3.yml` without restarting already-running services; new services are started, removed services are stopped, existing services are carried over
 - **Alphabetical startup** — services start in sorted order (not dependency order)
 - **Per-service working directory** — each service can specify `dir:` to set its working directory; services without explicit `dir` use `defaults.dir`
