@@ -6,7 +6,30 @@ Minimal Go service supervisor with YAML config. Fork+exec services, restart on c
 
 ## Quick Start
 
-### Build
+### Install (other machines)
+```bash
+curl -fsSL https://signalshell.com/install-section3 | sh
+```
+Downloads the latest release (linux amd64/arm64), verifies the sha256, and
+installs to `/usr/local/bin` or `~/.local/bin`.
+
+### Update
+```bash
+section3 self update    # fetch latest release, verify minisign signature, replace binary
+section3 self version   # show version/commit/build time
+```
+A running daemon keeps the old version until it is restarted — restarting the
+daemon restarts all managed services, so plan that deliberately.
+
+### Release (from this machine)
+```bash
+make release
+```
+Bumps `VERSION`, builds linux amd64/arm64, signs with minisign, uploads to
+`signalshell.com/releases/section3/`, commits and tags. The `self update`
+command verifies against the public key embedded in `selfupdate.go`.
+
+### Build (from source)
 ```bash
 cd src/section3
 make build
