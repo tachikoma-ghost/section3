@@ -44,16 +44,17 @@ defaults:
   restart: always
 
 services:
-  signalshell:
-    command: /home/node/.local/bin/signalshell serve
+  web:
+    command: /usr/local/bin/my-web-server --port 8080
 
-  voice:
-    command: /workspace/src/voice/bin/voice -config /workspace/src/voice/config.yaml
+  worker:
+    command: /usr/local/bin/my-worker --queue default
+    restart: on-crash
     depends_on:
-      - signalshell
+      - web
 
-  one-shot:
-    command: /bin/once.sh
+  init-once:
+    command: /usr/local/bin/migrate-db.sh
     restart: never
     dir: /tmp
 ```
@@ -78,6 +79,8 @@ section3 stop <name>   Stop a service
 section3 restart <name> Restart a service
 section3 reload        Reload config (add/remove services)
 section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
+section3 self version  Show binary version
+section3 self update   Update the binary to the latest release
 section3 help          Show this help
 ```
 
@@ -105,13 +108,14 @@ exec /workspace/src/section3/bin/section3
 
 ```
 src/section3/
-  main.go         # source
-  Makefile        # build
+  main.go         # supervisor source
+  selfupdate.go   # self version/update commands
+  Makefile        # build + release
   README.md       # this file
-  DEVELOPMENT.md  # architecture notes
   SPEC.md         # design spec
+  docs/           # architecture docs
   VERSION         # version
-  section3.yml    # sample config
+  section3.yml    # example config
   go.mod
   bin/section3    # compiled binary
 ```

@@ -1,26 +1,23 @@
-# Section3 - Service Supervisor Configuration
+# Section3 - Service Supervisor Configuration (example)
 # https://github.com/tachikoma-ghost/section3
+#
+# section3 reads /workspace/section3.yml by default.
+
+defaults:
+  dir: /workspace        # working directory for services that don't set their own
+  restart: always        # always | never | on-crash
 
 services:
-  signalshell:
-    command: /home/node/.local/bin/signalshell serve
-    restart: always
+  web:
+    command: /usr/local/bin/my-web-server --port 8080
 
-  stt-server:
-    command: python3 /workspace/src/voice/stt_server.py small 8766
-    restart: always
-
-  voice:
-    command: /workspace/src/voice/bin/voice -config /workspace/src/voice/config.yaml
-    restart: always
+  worker:
+    command: /usr/local/bin/my-worker --queue default
+    restart: on-crash    # restart only on non-zero exit
     depends_on:
-      - signalshell
-      - stt-server
+      - web              # documented ordering; not enforced
 
-  telegram:
-    command: /workspace/src/telegram/bin/telegram -config /workspace/src/telegram/config.yaml
-    restart: always
-
-  memory:
-    command: /workspace/src/memory/bin/memory -config /workspace/src/memory/config.yaml watch
-    restart: always
+  init-once:
+    command: /usr/local/bin/migrate-db.sh
+    dir: /tmp
+    restart: never       # run once, don't restart
