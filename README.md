@@ -83,11 +83,12 @@ services:
     init: true
 ```
 
-Use `init: true` (or `docker run --init`): section3 reaps its direct
-children, but if a service forks and dies, the orphaned grandchildren
-reparent to PID 1 — tini handles those.
+Use `init: true` (or `docker run --init`) so Docker puts a small init
+process at PID 1. section3 reaps its own direct children, but when a
+service forks and dies, its orphaned children reparent to PID 1, and the
+init process reaps those.
 
-Lifecycle maps onto Docker naturally:
+Docker lifecycle:
 - `docker stop` → SIGTERM → section3 stops all services gracefully, then exits
 - `docker kill -s HUP <ctr>` or `docker exec <ctr> section3 reload` → config reload
 - `docker exec <ctr> section3 status` → service status from outside
@@ -114,8 +115,8 @@ Update later with:
 section3 self update    # fetch latest release, verify minisign signature, replace binary
 ```
 
-A running daemon keeps the old version until it is restarted — restarting the
-daemon restarts all managed services, so plan that deliberately.
+A running daemon keeps the old version until it is restarted. Note that
+restarting the daemon restarts all of its services.
 
 ## Run
 
