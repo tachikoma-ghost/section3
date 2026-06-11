@@ -1,11 +1,13 @@
-<img src="assets/icon.png" width="80" align="right" />
+<p align="center">
+  <img src="assets/icon.png" width="100" alt="section3 icon" />
+</p>
+<h1 align="center">section3</h1>
+<p align="center">Service supervisor in a single static binary.</p>
 
-# Section3 — Service Supervisor
-
-Minimal Go service supervisor with YAML config. Fork+exec services, restart
-on crash, handle logs with rotation. A single static binary that works as an
-init process for containers or as a lightweight supervisor anywhere else —
-no systemd, no runit, one YAML file.
+section3 starts the services listed in one YAML file, restarts them when
+they crash, and rotates their logs. It is built to be the entrypoint of a
+Docker container that runs more than one process, and works the same way
+outside containers.
 
 ## CLI
 
@@ -62,35 +64,6 @@ stops services removed from the config and starts newly added ones; already-
 running services are left untouched, so a changed `command` takes effect on
 the next `section3 restart <name>`.
 
-## Install
-
-```bash
-curl -fsSL https://signalshell.com/install-section3 | sh
-```
-
-Downloads the latest release (linux amd64/arm64), verifies the sha256, and
-installs to `/usr/local/bin` or `~/.local/bin`.
-
-Update later with:
-
-```bash
-section3 self update    # fetch latest release, verify minisign signature, replace binary
-```
-
-A running daemon keeps the old version until it is restarted — restarting the
-daemon restarts all managed services, so plan that deliberately.
-
-## Run
-
-```bash
-# Start supervisor (blocks)
-section3
-
-# Or in background, then check status
-section3 &
-section3 status
-```
-
 ## Docker
 
 section3 works as the container entrypoint, supervising everything inside:
@@ -124,6 +97,35 @@ supervisor directly:
 ```bash
 #!/bin/bash
 exec /usr/local/bin/section3
+```
+
+## Install
+
+```bash
+curl -fsSL https://signalshell.com/install-section3 | sh
+```
+
+Downloads the latest release (linux amd64/arm64), verifies the sha256, and
+installs to `/usr/local/bin` or `~/.local/bin`.
+
+Update later with:
+
+```bash
+section3 self update    # fetch latest release, verify minisign signature, replace binary
+```
+
+A running daemon keeps the old version until it is restarted — restarting the
+daemon restarts all managed services, so plan that deliberately.
+
+## Run
+
+```bash
+# Start supervisor (blocks)
+section3
+
+# Or in background, then check status
+section3 &
+section3 status
 ```
 
 ## Logs
