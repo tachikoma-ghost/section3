@@ -766,3 +766,101 @@ func TestSocketSingleInstance(t *testing.T) {
 	// runDaemon would call os.Exit(1) if it could connect — verify the check logic.
 	// We test it by just confirming the dial succeeds, which is what the check uses.
 }
+
+func TestApplyBackoff(t *testing.T) {
+	svc := &Service{Name: "t"}
+
+	// Crash loop: short runs escalate 1s, 2s, 4s ... capped at maxBackoff.
+	if got := svc.applyBackoff(100 * time.Millisecond); got != 1*time.Second {
+		t.Errorf("crash 1: backoff = %v, want 1s", got)
+	}
+	if got := svc.applyBackoff(100 * time.Millisecond); got != 2*time.Second {
+		t.Errorf("crash 2: backoff = %v, want 2s", got)
+	}
+	for i := 0; i < 10; i++ {
+		svc.applyBackoff(100 * time.Millisecond)
+	}
+	if svc.backoff != maxBackoff {
+		t.Errorf("backoff = %v after crash loop, want capped at %v", svc.backoff, maxBackoff)
+	}
+
+	// A run of at least healthyRunReset starts over at 1s, crash count 1.
+	if got := svc.applyBackoff(healthyRunReset); got != 1*time.Second {
+		t.Errorf("backoff after healthy run = %v, want 1s", got)
+	}
+	if svc.crashCount != 1 {
+		t.Errorf("crashCount after healthy run = %d, want 1", svc.crashCount)
+	}
+}
+
+func TestParseSize(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+		err  bool
+	}{
+		{"1048576", 1048576, false},
+		{"512K", 512 * 1024, false},
+		{"10M", 10 * 1024 * 1024, false},
+		{"10MB", 10 * 1024 * 1024, false},
+		{"1g", 1024 * 1024 * 1024, false},
+		{" 2M ", 2 * 1024 * 1024, false},
+		{"", 0, true},
+		{"0", 0, true},
+		{"-5M", 0, true},
+		{"tenM", 0, true},
+	}
+	for _, c := range cases {
+		got, err := parseSize(c.in)
+		if c.err != (err != nil) {
+			t.Errorf("parseSize(%q): err = %v, want err=%v", c.in, err, c.err)
+			continue
+		}
+		if !c.err && got != c.want {
+			t.Errorf("parseSize(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestLoadConfigLogMaxSize(t *testing.T) {
+	yml := `
+defaults:
+  log_max_size: 5M
+services:
+  big:
+    command: /usr/bin/big
+    log_max_size: 100M
+  inherits:
+    command: /usr/bin/inherits
+`
+	f, err := os.CreateTemp(t.TempDir(), "section3-*.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(yml)
+	f.Close()
+
+	orig := configPath
+	configPath = f.Name()
+	t.Cleanup(func() { configPath = orig })
+
+	sup := NewSupervisor()
+	if err := sup.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if got := sup.services["big"].logMaxSize; got != 100*1024*1024 {
+		t.Errorf("big.logMaxSize = %d, want 100M", got)
+	}
+	if got := sup.services["inherits"].logMaxSize; got != 5*1024*1024 {
+		t.Errorf("inherits.logMaxSize = %d, want 5M (from defaults)", got)
+	}
+
+	// Invalid size must fail loudly, not fall back.
+	bad, _ := os.CreateTemp(t.TempDir(), "section3-*.yml")
+	bad.WriteString("services:\n  x:\n    command: /bin/x\n    log_max_size: huge\n")
+	bad.Close()
+	configPath = bad.Name()
+	if err := NewSupervisor().LoadConfig(); err == nil {
+		t.Error("LoadConfig with invalid log_max_size: want error, got nil")
+	}
+}

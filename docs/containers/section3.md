@@ -35,7 +35,7 @@ unknown subcommands are forwarded to it over the unix socket.
 `/workspace/section3.yml` — see [config schema](../specs/config.md) for full format.
 
 ### Log files
-Per-service log files at `/tmp/section3-logs/<name>.log`. Output is piped through the supervisor and rotates at 1MB even mid-run, keeping last 5 files (`<name>.log.1` ... `<name>.log.5`). The daemon's `section3.log` rotates the same way.
+Per-service log files at `/tmp/section3-logs/<name>.log`. Output is piped through the supervisor and rotates at `log_max_size` (default 1MB) even mid-run, keeping last 5 files (`<name>.log.1` ... `<name>.log.5`). The daemon's `section3.log` rotates the same way at the 1MB default.
 
 ### Release endpoint
 `self update` fetches `https://signalshell.com/releases/section3/latest.json`,
@@ -49,7 +49,7 @@ public key embedded in `selfupdate.go`, and replaces itself atomically.
 ## Key decisions
 
 - **Process groups** — each service in its own process group so stopping a service kills all its children
-- **Restart backoff** — exponential (1s → 2s → 4s → 8s → ... → max 60s). Resets only on explicit `stop`/`restart`; a long healthy run does not reset it, so the first crash after weeks of uptime still waits the previously accumulated backoff
+- **Restart backoff** — exponential (1s → 2s → 4s → 8s → ... → max 60s). A run of at least 60s counts as recovery and resets the backoff, so the first crash after a long healthy stretch restarts after 1s; explicit `stop`/`restart` also resets it
 - **Config reload** — `section3 reload` re-reads `section3.yml` without restarting already-running services; new services are started, removed services are stopped, existing services are carried over
 - **Alphabetical startup** — services start in sorted order (not dependency order)
 - **Per-service working directory** — each service can specify `dir:` to set its working directory; services without explicit `dir` use `defaults.dir`

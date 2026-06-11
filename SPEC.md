@@ -21,6 +21,7 @@ services:
     command: /path/to/executable args...
     dir: /workspace          # working directory (optional)
     restart: always | never | on-crash
+    log_max_size: 10M        # log rotation threshold (optional, default 1M)
     depends_on:
       - other-service
 ```
@@ -35,7 +36,7 @@ services:
 ## Supervisor Loop
 
 - Monitor all supervised processes
-- On crash: restart with exponential backoff (min 1s, max 60s, multiplier 2x)
+- On crash: restart with exponential backoff (min 1s, max 60s, multiplier 2x); a run of 60s+ resets the backoff
 - On SIGTERM: stop all services gracefully (SIGTERM, wait 5s, SIGKILL)
 - On SIGHUP: reload config
 
@@ -43,7 +44,7 @@ services:
 
 - Capture stdout + stderr of each service via a pipe through the supervisor
 - Write to `/tmp/section3-logs/<name>.log`
-- Rotate when file would exceed 1MB (rename to `<name>.log.1`, start new `<name>.log`) — works mid-run, no restart needed
+- Rotate when file would exceed `log_max_size` (default 1MB): rename to `<name>.log.1`, start new `<name>.log`; works mid-run, no restart needed
 - Keep last 5 rotated files per service
 - The daemon's own `section3.log` rotates by the same rules
 

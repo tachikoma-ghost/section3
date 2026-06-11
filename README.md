@@ -36,6 +36,7 @@ section3 reads `/workspace/section3.yml`:
 defaults:
   dir: /workspace        # working directory for services that don't set their own
   restart: always        # always | never | on-crash
+  log_max_size: 10M      # log rotation threshold, default 1M
 
 services:
   web:
@@ -59,7 +60,8 @@ Restart policies:
 - `never` — do not restart
 - `on-crash` — restart only on non-zero exit
 
-Restarts back off exponentially up to 60s. `section3 reload` (or SIGHUP)
+Restarts back off exponentially up to 60s; a run of at least 60s counts as
+recovery and resets the backoff. `section3 reload` (or SIGHUP)
 stops services removed from the config and starts newly added ones; already-
 running services are left untouched, so a changed `command` takes effect on
 the next `section3 restart <name>`.
@@ -133,9 +135,10 @@ section3 status
 
 Logs go to `/tmp/section3-logs/<name>.log`
 
-Output is piped through the supervisor, so logs rotate at 1MB even while a
-service is running, keeping last 5 versions (`<name>.log.1` ...
-`<name>.log.5`). The daemon's own `section3.log` rotates the same way.
+Output is piped through the supervisor, so logs rotate even while a service
+is running, keeping last 5 versions (`<name>.log.1` ... `<name>.log.5`). The
+rotation threshold is `log_max_size` (default 1MB), settable per service or
+in `defaults:`. The daemon's own `section3.log` rotates the same way.
 
 ## Building from source
 

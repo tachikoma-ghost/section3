@@ -29,6 +29,7 @@ var (
 const (
 	maxBackoff          = 60 * time.Second
 	backoffMul          = 2
+	healthyRunReset     = 60 * time.Second // a run at least this long resets the backoff
 	startStagger        = 100 * time.Millisecond
 	maxLogSize          = 1 * 1024 * 1024 // 1MB
 	maxLogBackups       = 5               // rotated copies kept per log (.1 .. .5)
@@ -49,20 +50,43 @@ type Config struct {
 }
 
 type ServiceConfig struct {
-	Command   string   `yaml:"command"`
-	Dir       string   `yaml:"dir"`
-	Restart   string   `yaml:"restart"` // always, never, on-crash
-	DependsOn []string `yaml:"depends_on"`
+	Command    string   `yaml:"command"`
+	Dir        string   `yaml:"dir"`
+	Restart    string   `yaml:"restart"`      // always, never, on-crash
+	LogMaxSize string   `yaml:"log_max_size"` // e.g. "10M", "512K"; default 1M
+	DependsOn  []string `yaml:"depends_on"`
+}
+
+// parseSize parses a human-readable size like "10M", "512K", "1G", or a
+// plain byte count. A trailing "B" is accepted ("10MB").
+func parseSize(s string) (int64, error) {
+	v := strings.ToUpper(strings.TrimSpace(s))
+	v = strings.TrimSuffix(v, "B")
+	mul := int64(1)
+	switch {
+	case strings.HasSuffix(v, "K"):
+		mul, v = 1024, strings.TrimSuffix(v, "K")
+	case strings.HasSuffix(v, "M"):
+		mul, v = 1024*1024, strings.TrimSuffix(v, "M")
+	case strings.HasSuffix(v, "G"):
+		mul, v = 1024*1024*1024, strings.TrimSuffix(v, "G")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid size %q (use e.g. 512K, 10M, 1G)", s)
+	}
+	return n * mul, nil
 }
 
 type Service struct {
-	Name    string
-	Command string
-	Dir     string
-	Restart string
-	cmd     *exec.Cmd
-	logw    *rotatingWriter
-	logPath string
+	Name       string
+	Command    string
+	Dir        string
+	Restart    string
+	logMaxSize int64
+	cmd        *exec.Cmd
+	logw       *rotatingWriter
+	logPath    string
 
 	mu         sync.Mutex
 	stopped    bool
@@ -108,12 +132,24 @@ func (s *Supervisor) LoadConfig() error {
 		if sc.Restart == "" {
 			sc.Restart = cfg.Defaults.Restart
 		}
+		if sc.LogMaxSize == "" {
+			sc.LogMaxSize = cfg.Defaults.LogMaxSize
+		}
+		logMaxSize := int64(maxLogSize)
+		if sc.LogMaxSize != "" {
+			n, err := parseSize(sc.LogMaxSize)
+			if err != nil {
+				return fmt.Errorf("service %s: log_max_size: %w", name, err)
+			}
+			logMaxSize = n
+		}
 		s.services[name] = &Service{
-			Name:    name,
-			Command: sc.Command,
-			Dir:     sc.Dir,
-			Restart: sc.Restart,
-			logPath: filepath.Join(logDir, name+".log"),
+			Name:       name,
+			Command:    sc.Command,
+			Dir:        sc.Dir,
+			Restart:    sc.Restart,
+			logMaxSize: logMaxSize,
+			logPath:    filepath.Join(logDir, name+".log"),
 		}
 		s.serviceKeys = append(s.serviceKeys, name)
 	}
@@ -138,11 +174,14 @@ type rotatingWriter struct {
 	lastFail time.Time
 }
 
-func newRotatingWriter(path string) (*rotatingWriter, error) {
+func newRotatingWriter(path string, maxSize int64) (*rotatingWriter, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
-	w := &rotatingWriter{path: path, maxSize: maxLogSize, maxBackups: maxLogBackups}
+	if maxSize <= 0 {
+		maxSize = maxLogSize
+	}
+	w := &rotatingWriter{path: path, maxSize: maxSize, maxBackups: maxLogBackups}
 	if err := w.open(); err != nil {
 		return nil, err
 	}
@@ -268,7 +307,7 @@ func (s *Service) Start() error {
 
 	// The writer survives crash restarts; Stop() closes and clears it.
 	if s.logw == nil {
-		w, err := newRotatingWriter(s.logPath)
+		w, err := newRotatingWriter(s.logPath, s.logMaxSize)
 		if err != nil {
 			return err
 		}
@@ -329,6 +368,27 @@ func (s *Service) shouldRestart(exitErr error) bool {
 	}
 }
 
+// applyBackoff advances the restart backoff after a restartable exit and
+// returns the delay to sleep. A run of at least healthyRunReset is treated
+// as recovery: the next crash starts over at 1s instead of paying the
+// backoff accumulated by earlier crash loops. Caller must hold s.mu.
+func (s *Service) applyBackoff(uptime time.Duration) time.Duration {
+	if uptime >= healthyRunReset {
+		s.backoff = 0
+		s.crashCount = 0
+	}
+	if s.backoff == 0 {
+		s.backoff = 1 * time.Second
+	} else {
+		s.backoff *= backoffMul
+		if s.backoff > maxBackoff {
+			s.backoff = maxBackoff
+		}
+	}
+	s.crashCount++
+	return s.backoff
+}
+
 func (s *Service) wait(cmd *exec.Cmd, done chan struct{}) {
 	defer close(done)
 
@@ -351,17 +411,9 @@ func (s *Service) wait(cmd *exec.Cmd, done chan struct{}) {
 		return
 	}
 
+	uptime := time.Since(s.startTime)
 	s.lastCrash = time.Now()
-	if s.backoff == 0 {
-		s.backoff = 1 * time.Second
-	} else {
-		s.backoff *= backoffMul
-		if s.backoff > maxBackoff {
-			s.backoff = maxBackoff
-		}
-	}
-	s.crashCount++
-	backoff := s.backoff
+	backoff := s.applyBackoff(uptime)
 	crashCount := s.crashCount
 
 	s.mu.Unlock()
@@ -714,7 +766,7 @@ func runDaemon() {
 		os.Exit(1)
 	}
 
-	logw, err := newRotatingWriter(filepath.Join(logDir, "section3.log"))
+	logw, err := newRotatingWriter(filepath.Join(logDir, "section3.log"), maxLogSize)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "section3: failed to open log: %v\n", err)
 		os.Exit(1)

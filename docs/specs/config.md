@@ -9,12 +9,14 @@ Full YAML format for `/workspace/section3.yml`.
 defaults:
   dir: /workspace            # default working directory for all services
   restart: always             # default restart policy
+  log_max_size: 10M           # default log rotation threshold
 
 services:
   <name>:
     command: /path/to/exe     # required; the command to run
     dir: /workspace           # working directory; uses defaults.dir if omitted
     restart: always           # always | never | on-crash
+    log_max_size: 100M        # rotation threshold; uses defaults if omitted
     depends_on:               # parsed but not enforced (see system.md)
       - other-service
 ```
@@ -26,7 +28,11 @@ services:
 | `command` | string | required | Executable and arguments |
 | `dir` | string | `defaults.dir` | Working directory for the service |
 | `restart` | string | `defaults.restart` | `always` \| `never` \| `on-crash` |
+| `log_max_size` | string | `defaults.log_max_size`, else `1M` | Log rotation threshold; accepts `K`/`M`/`G` suffixes or plain bytes |
 | `depends_on` | list | none | Service names this depends on (not enforced) |
+
+An invalid `log_max_size` is a config error: `LoadConfig` fails and `reload`
+reports it instead of falling back silently.
 
 ## Defaults
 
@@ -62,7 +68,7 @@ services:
 
 ## Log files
 
-Log files are written to `/tmp/section3-logs/<service-name>.log`. Service output is piped through the supervisor, so rotation happens as soon as a write would push the file past 1MB — including while the service is running:
+Log files are written to `/tmp/section3-logs/<service-name>.log`. Service output is piped through the supervisor, so rotation happens as soon as a write would push the file past `log_max_size` (default 1MB), including while the service is running:
 
 - `<name>.log` → `<name>.log.1`
 - `<name>.log.1` → `<name>.log.2`
