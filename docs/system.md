@@ -3,12 +3,13 @@
 
 Documentation follows the [Refraction documentation standard v1.1](https://signalshell.com/refraction/v1.1).
 
-Service supervisor for the Tachikoma workspace. Reads a YAML config, starts all configured services, monitors them, and restarts on failure. The init process for all long-running components.
+Service supervisor in a single static binary. Reads a YAML config, starts all configured services, monitors them, and restarts on failure. Designed to run as the init process of a container that hosts more than one long-running process.
 
 ## External actors
 
-- **Developer (Martin / Tachikoma)** — edits `section3.yml`, runs `section3 status/start/stop/restart/reload`
-- **Managed services** — telegram bot, location server, voice app, memory watcher, browser server, signalshell, expo apps
+- **Operator** — edits `section3.yml`, runs `section3 status/start/stop/restart/reload`
+- **Managed services** — the long-running processes defined in the config
+- **Release server** — `signalshell.com/releases/section3/` serves signed binaries for `section3 self update` and the install script
 - **Operating system** — process groups, signals, file system for logs
 
 ## Containers

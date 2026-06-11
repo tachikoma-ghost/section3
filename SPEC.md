@@ -1,6 +1,6 @@
 # Section3 — Service Supervisor
 
-A minimal Go service supervisor for Tachikoma. Fork+exec services from YAML config, restart on crash, handle logs with rotation.
+A minimal Go service supervisor. Fork+exec services from YAML config, restart on crash, handle logs with rotation.
 
 ## Design
 
@@ -57,6 +57,8 @@ section3 reload           Reload config (add/remove services)
 section3 status           Show status of all services
 section3 status <name>    Show status of one service
 section3 tail [-n N] [name]  Tail logs (default: 20 lines, all services if no name)
+section3 self version     Show binary version
+section3 self update      Update the binary to the latest release
 section3 help             Show help
 ```
 
@@ -64,15 +66,14 @@ section3 help             Show help
 
 ```
 $ section3 status
-signalshell  running  PID 12345  uptime 2h34m
-voice        running  PID 12346  uptime 2h34m
+web     running  PID 12345  uptime 2h34m
+worker  running  PID 12346  uptime 2h34m
 ```
 
 ## Exit Codes
 
-- 0: success (status printed)
-- 1: service failed to start
-- 2: invalid command
+- 0: success
+- 1: error (daemon not running, unknown command or service, failed action)
 
 ## Future Extensibility
 

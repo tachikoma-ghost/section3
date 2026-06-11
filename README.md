@@ -157,15 +157,13 @@ command verifies against the public key embedded in `selfupdate.go`.
 ## Files
 
 ```
-src/section3/
-  main.go         # supervisor source
-  selfupdate.go   # self version/update commands
-  Makefile        # build + release
-  README.md       # this file
-  SPEC.md         # design spec
-  docs/           # architecture docs
-  VERSION         # version
-  section3.yml    # example config
-  go.mod
-  bin/section3    # compiled binary
+main.go         # supervisor source
+selfupdate.go   # self version/update commands
+Makefile        # build + release
+README.md       # this file
+SPEC.md         # design spec
+docs/           # architecture docs
+VERSION         # version
+section3.yml    # example config
+bin/section3    # compiled binary (gitignored)
 ```

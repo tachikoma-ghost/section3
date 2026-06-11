@@ -3,7 +3,8 @@
 
 ## Architecture
 
-Main binary at `src/section3/main.go` (~670 lines). No separate packages.
+Single `main` package: `main.go` (supervisor, CLI, log rotation) and
+`selfupdate.go` (`self version`/`self update`).
 
 Key functions:
 - `LoadConfig()` — parse `section3.yml`
@@ -42,5 +43,9 @@ go test ./...
 ## Building
 
 ```bash
-go build -o bin/section3 .
+make build
 ```
+
+`make build` embeds version, commit, and build time via `-ldflags`; a plain
+`go build` works but `self version` then reports `dev`. Releases are built
+with `make release` (see the README).

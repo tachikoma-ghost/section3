@@ -40,8 +40,8 @@ defaults:
 
 services:
   # Uses dir: /workspace
-  signalshell:
-    command: /home/node/.local/bin/signalshell serve
+  web:
+    command: /usr/local/bin/my-web-server --port 8080
 
   # Overrides dir to /tmp
   temp-service:
