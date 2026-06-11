@@ -784,7 +784,14 @@ Commands:
   section3 restart <name> Restart a service
   section3 reload        Reload config (add/remove services)
   section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
+  section3 self version  Show binary version
+  section3 self update   Update the binary to the latest release
   section3 help          Show this help`)
+	case "self":
+		if err := runSelf(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	default:
 		if err := dialDaemon(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
