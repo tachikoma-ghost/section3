@@ -356,6 +356,99 @@ services:
 	}
 }
 
+// reloadConfig used to carry every already-known service over from the old
+// supervisor untouched, which meant an edited `command:` was parsed and then
+// dropped on the floor: reload reported success and kept running the old
+// process. The only way to apply the edit was to restart section3, which
+// operators are explicitly told never to do.
+func TestReloadAppliesChangedCommand(t *testing.T) {
+	dir := t.TempDir()
+
+	origSocket, origLogDir, origConfig := socketPath, logDir, configPath
+	origSupervisor := supervisor
+	socketPath = filepath.Join(dir, "section3.sock")
+	logDir = dir
+	configPath = filepath.Join(dir, "section3.yml")
+	t.Cleanup(func() {
+		socketPath, logDir, configPath = origSocket, origLogDir, origConfig
+		supervisorMu.Lock()
+		supervisor = origSupervisor
+		supervisorMu.Unlock()
+	})
+
+	write := func(command string) {
+		yml := "services:\n  svc:\n    command: " + command + "\n    restart: never\n"
+		if err := os.WriteFile(configPath, []byte(yml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("sleep 60")
+	sup := NewSupervisor()
+	if err := sup.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.services["svc"].Start(); err != nil {
+		t.Fatal(err)
+	}
+	first := sup.services["svc"]
+	t.Cleanup(func() {
+		supervisorMu.RLock()
+		live := supervisor.services["svc"]
+		supervisorMu.RUnlock()
+		if live != nil {
+			live.Stop()
+		}
+	})
+
+	supervisorMu.Lock()
+	supervisor = sup
+	supervisorMu.Unlock()
+
+	// Unchanged config: the running process must be left exactly as it is.
+	if err := reloadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	supervisorMu.RLock()
+	carried := supervisor.services["svc"]
+	supervisorMu.RUnlock()
+	if carried != first {
+		t.Error("reload replaced a service whose definition did not change")
+	}
+
+	// Changed command: the old process must be stopped and the new definition
+	// started in its place.
+	write("sleep 120")
+	if err := reloadConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisorMu.RLock()
+	replaced := supervisor.services["svc"]
+	supervisorMu.RUnlock()
+
+	if replaced == first {
+		t.Fatal("reload kept the old service after its command changed")
+	}
+	if replaced.Command != "sleep 120" {
+		t.Errorf("live service Command = %q, want the edited one", replaced.Command)
+	}
+
+	first.mu.Lock()
+	oldRunning := first.running
+	first.mu.Unlock()
+	if oldRunning {
+		t.Error("the superseded process is still running")
+	}
+
+	replaced.mu.Lock()
+	newRunning := replaced.running
+	replaced.mu.Unlock()
+	if !newRunning {
+		t.Error("the new definition was not started")
+	}
+}
+
 func TestRotatingWriter(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "x.log")

@@ -541,6 +541,21 @@ func (s *Supervisor) Tail(name string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// sameDefinition reports whether two Services describe the same process, so a
+// reload can tell a service it may leave running from one it has to replace.
+//
+// Only the fields that determine the process are compared. logMaxSize is
+// deliberately not among them: it changes where output goes, not what runs,
+// and bouncing a service to resize its log would cost more than it buys.
+// DependsOn is likewise about start ordering, which has already happened.
+func (s *Service) sameDefinition(other *Service) bool {
+	if s == nil || other == nil {
+		return false
+	}
+
+	return s.Command == other.Command && s.Dir == other.Dir && s.Restart == other.Restart
+}
+
 // --- Config reload ---
 
 func reloadConfig() error {
@@ -561,16 +576,39 @@ func reloadConfig() error {
 		}
 	}
 
-	// Carry over existing running services; start new ones.
+	// Carry over existing running services; start new ones; replace the ones
+	// whose definition changed.
+	//
+	// That last case is why the comparison exists. Carrying the old Service
+	// over unconditionally kept the old *process* — with the old command line
+	// — while the freshly parsed definition was thrown away, so editing a
+	// `command:` and running `reload` did nothing at all and said "reloaded".
+	// The only way to pick the edit up was to restart section3 itself, which
+	// is the one thing an operator is told never to do.
 	for _, name := range newSup.serviceKeys {
-		if existing, ok := old.services[name]; ok {
-			newSup.services[name] = existing
-		} else {
+		existing, ok := old.services[name]
+		if !ok {
 			if err := newSup.services[name].Start(); err != nil {
 				log.Printf("failed to start %s: %v", name, err)
 			} else {
 				log.Printf("started %s (added to config)", name)
 			}
+			continue
+		}
+
+		if existing.sameDefinition(newSup.services[name]) {
+			newSup.services[name] = existing
+			continue
+		}
+
+		// Definition changed: the running process no longer matches what the
+		// config asks for, so it is stopped and the new definition started in
+		// its place. Restarting on a config edit is the point of `reload`;
+		// doing it silently is not, hence the log line.
+		log.Printf("restarting %s (definition changed)", name)
+		existing.Stop()
+		if err := newSup.services[name].Start(); err != nil {
+			log.Printf("failed to restart %s: %v", name, err)
 		}
 	}
 
@@ -834,7 +872,7 @@ Commands:
   section3 start <name>  Start a service
   section3 stop <name>   Stop a service
   section3 restart <name> Restart a service
-  section3 reload        Reload config (add/remove services)
+  section3 reload        Reload config (add/remove/redefine services)
   section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
   section3 self version  Show binary version
   section3 self update   Update the binary to the latest release

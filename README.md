@@ -18,7 +18,7 @@ section3 status <name> Show status of one service
 section3 start <name>  Start a service
 section3 stop <name>   Stop a service
 section3 restart <name> Restart a service
-section3 reload        Reload config (add/remove services)
+section3 reload        Reload config (add/remove/redefine services)
 section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
 section3 self version  Show binary version
 section3 self update   Update the binary to the latest release
@@ -61,10 +61,14 @@ Restart policies:
 - `on-crash` — restart only on non-zero exit
 
 Restarts back off exponentially up to 60s; a run of at least 60s counts as
-recovery and resets the backoff. `section3 reload` (or SIGHUP)
-stops services removed from the config and starts newly added ones; already-
-running services are left untouched, so a changed `command` takes effect on
-the next `section3 restart <name>`.
+recovery and resets the backoff. `section3 reload` (or SIGHUP) stops services
+removed from the config, starts newly added ones, and restarts any whose
+`command`, `dir` or `restart` policy changed. Services whose definition is
+unchanged keep running and are not disturbed.
+
+`log_max_size` and `depends_on` do not count as changes: the first decides
+where output goes rather than what runs, and the second is start ordering that
+has already happened. Both take effect for the next start of that service.
 
 ## Docker
 
