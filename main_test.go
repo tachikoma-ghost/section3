@@ -319,9 +319,9 @@ services:
 	f.WriteString(yml)
 	f.Close()
 
-	orig := configPath
-	configPath = f.Name()
-	t.Cleanup(func() { configPath = orig })
+	orig := configDir
+	configDir = filepath.Dir(f.Name())
+	t.Cleanup(func() { configDir = orig })
 
 	sup := NewSupervisor()
 	if err := sup.LoadConfig(); err != nil {
@@ -364,13 +364,14 @@ services:
 func TestReloadAppliesChangedCommand(t *testing.T) {
 	dir := t.TempDir()
 
-	origSocket, origLogDir, origConfig := socketPath, logDir, configPath
+	origSocket, origLogDir, origConfig := socketPath, logDir, configDir
 	origSupervisor := supervisor
 	socketPath = filepath.Join(dir, "section3.sock")
 	logDir = dir
-	configPath = filepath.Join(dir, "section3.yml")
+	configDir = dir
+	cfgFile := filepath.Join(dir, "section3.yml")
 	t.Cleanup(func() {
-		socketPath, logDir, configPath = origSocket, origLogDir, origConfig
+		socketPath, logDir, configDir = origSocket, origLogDir, origConfig
 		supervisorMu.Lock()
 		supervisor = origSupervisor
 		supervisorMu.Unlock()
@@ -378,7 +379,7 @@ func TestReloadAppliesChangedCommand(t *testing.T) {
 
 	write := func(command string) {
 		yml := "services:\n  svc:\n    command: " + command + "\n    restart: never\n"
-		if err := os.WriteFile(configPath, []byte(yml), 0o644); err != nil {
+		if err := os.WriteFile(cfgFile, []byte(yml), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -736,8 +737,8 @@ func TestSocketRestart(t *testing.T) {
 }
 
 func TestSocketReload(t *testing.T) {
-	origConfig := configPath
-	t.Cleanup(func() { configPath = origConfig })
+	origConfig := configDir
+	t.Cleanup(func() { configDir = origConfig })
 
 	// Initial config: only "alpha"
 	writeConfig := func(yml string) {
@@ -747,7 +748,7 @@ func TestSocketReload(t *testing.T) {
 		}
 		f.WriteString(yml)
 		f.Close()
-		configPath = f.Name()
+		configDir = filepath.Dir(f.Name())
 	}
 
 	writeConfig(`
@@ -933,9 +934,9 @@ services:
 	f.WriteString(yml)
 	f.Close()
 
-	orig := configPath
-	configPath = f.Name()
-	t.Cleanup(func() { configPath = orig })
+	orig := configDir
+	configDir = filepath.Dir(f.Name())
+	t.Cleanup(func() { configDir = orig })
 
 	sup := NewSupervisor()
 	if err := sup.LoadConfig(); err != nil {
@@ -952,7 +953,7 @@ services:
 	bad, _ := os.CreateTemp(t.TempDir(), "section3-*.yml")
 	bad.WriteString("services:\n  x:\n    command: /bin/x\n    log_max_size: huge\n")
 	bad.Close()
-	configPath = bad.Name()
+	configDir = filepath.Dir(bad.Name())
 	if err := NewSupervisor().LoadConfig(); err == nil {
 		t.Error("LoadConfig with invalid log_max_size: want error, got nil")
 	}

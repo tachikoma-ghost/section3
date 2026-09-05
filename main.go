@@ -21,10 +21,28 @@ import (
 )
 
 var (
-	configPath = "/workspace/section3.yml"
+	configDir  = defaultConfigDir()
 	logDir     = "/tmp/section3-logs"
 	socketPath = "/tmp/section3.sock"
 )
+
+// defaultConfigDir is where section3 looks for service definitions. It is a
+// directory rather than a single file so that whatever installs a service can
+// also declare it: a setup script drops one file here and the service exists,
+// with no second edit in an unrelated repo to remember. What is running stays
+// discoverable through `section3 config`, which names the file each service
+// came from.
+func defaultConfigDir() string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".config")
+	}
+	return filepath.Join(dir, "section3", "conf.d")
+}
 
 const (
 	maxBackoff          = 60 * time.Second
@@ -102,30 +120,79 @@ type Service struct {
 type Supervisor struct {
 	services    map[string]*Service
 	serviceKeys []string // sorted
+	// origins maps a service name to the config file that declared it, so
+	// duplicates can be reported against both files and `section3 config`
+	// can show where each service came from.
+	origins map[string]string
 }
 
 func NewSupervisor() *Supervisor {
-	return &Supervisor{services: make(map[string]*Service)}
+	return &Supervisor{
+		services: make(map[string]*Service),
+		origins:  make(map[string]string),
+	}
 }
 
 // --- Config ---
 
+// LoadConfig reads every *.yml and *.yaml in configDir, in lexical order.
+//
+// An empty or missing directory is an error rather than an empty supervisor.
+// A section3 that starts cleanly and manages nothing looks identical to one
+// doing its job until someone notices the services are gone, and the most
+// likely cause of an empty directory is a half-finished migration.
 func (s *Supervisor) LoadConfig() error {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	if configDir == "" {
+		return fmt.Errorf("no config directory: could not determine one from XDG_CONFIG_HOME or the home directory")
+	}
+	var files []string
+	for _, pattern := range []string{"*.yml", "*.yaml"} {
+		matches, err := filepath.Glob(filepath.Join(configDir, pattern))
+		if err != nil {
+			return err
 		}
+		files = append(files, matches...)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no config files in %s: section3 has nothing to supervise", configDir)
+	}
+	sort.Strings(files)
+
+	s.serviceKeys = nil
+	for _, path := range files {
+		if err := s.loadFile(path); err != nil {
+			return err
+		}
+	}
+	sort.Strings(s.serviceKeys)
+	return nil
+}
+
+// loadFile merges one config file into the supervisor.
+//
+// Each file's `defaults:` apply to that file's own services and no others. A
+// fragment dropped in by an installer must not inherit `dir:` from whichever
+// unrelated file happened to sort ahead of it.
+//
+// A service name claimed by two files is an error naming both. Letting one win
+// would make the outcome depend on filename order, which is not something the
+// person adding the second file would think to check.
+func (s *Supervisor) loadFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return err
 	}
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return err
+		return fmt.Errorf("%s: %w", path, err)
 	}
 
-	s.serviceKeys = nil
 	for name, sc := range cfg.Services {
+		if prev, ok := s.origins[name]; ok {
+			return fmt.Errorf("service %q is defined in both %s and %s", name, prev, path)
+		}
+		s.origins[name] = path
 		if sc.Dir == "" {
 			sc.Dir = cfg.Defaults.Dir
 		}
@@ -153,8 +220,32 @@ func (s *Supervisor) LoadConfig() error {
 		}
 		s.serviceKeys = append(s.serviceKeys, name)
 	}
-	sort.Strings(s.serviceKeys)
 	return nil
+}
+
+// ConfigOrigins reports the config directory and which file declared each
+// service. With definitions spread across a directory instead of gathered in
+// one file, this is what replaces reading that file top to bottom.
+func (s *Supervisor) ConfigOrigins() string {
+	byFile := make(map[string][]string)
+	for _, name := range s.serviceKeys {
+		byFile[s.origins[name]] = append(byFile[s.origins[name]], name)
+	}
+	files := make([]string, 0, len(byFile))
+	for f := range byFile {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "config dir: %s", configDir)
+	for _, f := range files {
+		fmt.Fprintf(&b, "\n\n%s", f)
+		for _, name := range byFile[f] {
+			fmt.Fprintf(&b, "\n  %s", name)
+		}
+	}
+	return b.String()
 }
 
 // --- Log ---
@@ -733,6 +824,9 @@ func handleConn(conn net.Conn) {
 		}
 		fmt.Fprintln(w, "reloaded")
 
+	case "config":
+		fmt.Fprintln(w, sup.ConfigOrigins())
+
 	case "tail":
 		n := 20
 		name := ""
@@ -873,6 +967,7 @@ Commands:
   section3 stop <name>   Stop a service
   section3 restart <name> Restart a service
   section3 reload        Reload config (add/remove/redefine services)
+  section3 config        Show the config directory and which file declared each service
   section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
   section3 self version  Show binary version
   section3 self update   Update the binary to the latest release
