@@ -1,0 +1,127 @@
+# Mirror a published section3 release onto GitHub Releases.
+#
+# ASSUMPTION, stated because it was an open question and this file answers it
+# one way: signalshell.com stays the SOURCE OF TRUTH. `section3 self update`
+# reads its manifest, and old binaries in the field will keep polling that URL
+# forever regardless of what we do here, so that endpoint has to keep answering
+# either way. GitHub is therefore a mirror for discovery, not the origin. If
+# you want the opposite, this file is the thing to rewrite.
+#
+# It does NOT build. Two reasons:
+#
+#  1. The release signing key lives on the release machine and is not going
+#     into CI secrets to be used unattended. A workflow that built its own
+#     binaries could not sign them.
+#  2. Publishing unsigned binaries on GitHub would recreate the exact hole
+#     install.sh was written to close: an install path with nothing to verify
+#     against. Every artifact this attaches is the signed one, with its
+#     signature beside it.
+#
+# So the flow is: `make release` builds, signs and uploads to signalshell.com,
+# then commits and tags. Pushing that tag runs this, which fetches what was
+# published, verifies each signature against the same public key the binary
+# embeds, and attaches binary + .minisig + .sha256 to a GitHub release. A
+# verification failure fails the workflow rather than publishing.
+#
+# Not done here, deliberately: rebuilding from the tag and comparing hashes
+# against the published binary. The build stamps -X main.buildTime, so it is
+# not reproducible and the comparison would always fail. Making it
+# reproducible is a separate change worth its own decision.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release number to mirror (e.g. 4)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: https://signalshell.com/releases/section3
+      # Key ID 4553E564F8700D47. Must match releasePublicKey in selfupdate.go
+      # and PUBKEY in install.sh.
+      PUBKEY: RWRHDXD4ZOVTRfvfv/shVjvlkOBGp3OxN+KILl6yDWY20SByxOQP/OnO
+      PLATFORMS: linux-amd64 linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the release number
+        id: rel
+        run: |
+          set -eu
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          case "$version" in
+            ''|*[!0-9]*) echo "not a release number: '$version'" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check the key constant has not drifted
+        run: |
+          set -eu
+          # Three copies of one key. A silent divergence would mean install.sh
+          # or this workflow trusting something the binary does not.
+          grep -q "$PUBKEY" selfupdate.go || { echo "public key differs from selfupdate.go" >&2; exit 1; }
+          grep -q "$PUBKEY" install.sh    || { echo "public key differs from install.sh" >&2; exit 1; }
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: Fetch and verify the published artifacts
+        run: |
+          set -eu
+          v='${{ steps.rel.outputs.version }}'
+          mkdir -p dist
+
+          # The manifest must already name this version, or the tag was pushed
+          # before the upload and the mirror would publish a release nobody can
+          # update to.
+          published=$(curl -fsSL "$BASE_URL/latest.json" |
+            sed -n 's/.*"version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+          if [ "$published" != "$v" ]; then
+            echo "latest.json says v$published, this tag is v$v — upload first (make release)" >&2
+            exit 1
+          fi
+
+          for p in $PLATFORMS; do
+            name="section3-$p"
+            curl -fsSL "$BASE_URL/$v/$name"         -o "dist/$name"
+            curl -fsSL "$BASE_URL/$v/$name.minisig" -o "dist/$name.minisig"
+            curl -fsSL "$BASE_URL/$v/$name.sha256"  -o "dist/$name.sha256"
+            # Verdict on its own line: a `| grep` here would report success
+            # whenever the word matched, which is how an unsigned binary ships.
+            minisign -V -P "$PUBKEY" -m "dist/$name" -x "dist/$name.minisig"
+            echo "verified $name"
+            echo "$(cat "dist/$name.sha256")  dist/$name" | sha256sum -c -
+          done
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.rel.outputs.version }}
+          name: section3 v${{ steps.rel.outputs.version }}
+          files: dist/*
+          body: |
+            Binaries mirrored from https://signalshell.com/releases/section3/${{ steps.rel.outputs.version }}/
+            and verified against the release key (ID 4553E564F8700D47) before upload.
+
+            Install:
+
+                curl -sSL https://signalshell.com/releases/section3/install.sh | sh
+
+            The installer verifies the signature and refuses to install without one.
+            `section3 self update` continues to read signalshell.com, which remains
+            the source of truth for updates.

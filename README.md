@@ -112,8 +112,22 @@ exec /usr/local/bin/section3
 curl -fsSL https://signalshell.com/install-section3 | sh
 ```
 
-Downloads the latest release (linux amd64/arm64), verifies the sha256, and
-installs to `/usr/local/bin` or `~/.local/bin`.
+Downloads the latest release (linux amd64/arm64), **verifies its minisign
+signature** against the same key the binary embeds, and installs to
+`/usr/local/bin` or `~/.local/bin` (or `$SECTION3_INSTALL_DIR`).
+
+It refuses to install anything it cannot verify. If neither `minisign` nor
+`openssl` is present it stops and says so, rather than continuing unverified.
+That closes the one gap in the chain: `self update` has always checked the
+signature, but the *first* install had no trusted binary to check with, and
+until 2026-09-07 it compared a sha256 fetched from the same server as the
+binary, which catches a corrupted download and nothing else.
+
+Source: `install.sh` in this repo, kept byte-identical to `install-section3`
+in the signalshell-landing repo, which is what the URL serves. `make
+check-installer` diffs them; `sh install_test.sh` tests the real thing against
+the live release (including that a tampered binary is refused by both
+verifiers).
 
 Update later with:
 
@@ -157,17 +171,29 @@ make test
 make release
 ```
 
-Bumps `VERSION`, builds linux amd64/arm64, signs with minisign, uploads to
-`signalshell.com/releases/section3/`, commits and tags. The `self update`
-command verifies against the public key embedded in `selfupdate.go`.
+Bumps `VERSION`, builds linux amd64/arm64, signs with minisign, uploads the
+binaries and `install.sh` to `signalshell.com/releases/section3/`, commits and
+tags. The `self update` command verifies against the public key embedded in
+`selfupdate.go`.
+
+Pushing that tag runs `.github/workflows/release.yml`, which mirrors the
+published, signed artifacts onto GitHub Releases. It does not build or sign:
+the key stays on the release machine, and publishing unsigned binaries would
+reopen the hole `install.sh` closes. signalshell.com remains the source of
+truth for `self update`.
+
+The public key appears in three places (`selfupdate.go`, `install.sh`, the
+workflow). The workflow fails if they disagree.
 
 ## Files
 
 ```
-main.go         # supervisor source
-selfupdate.go   # self version/update commands
-Makefile        # build + release
-README.md       # this file
+main.go          # supervisor source
+selfupdate.go    # self version/update commands
+install.sh       # signature-verifying installer (mirrored to the landing site)
+install_test.sh  # differential test of install.sh against the live release
+Makefile         # build + release
+README.md        # this file
 SPEC.md         # design spec
 docs/           # architecture docs
 VERSION         # version

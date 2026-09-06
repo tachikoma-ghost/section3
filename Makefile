@@ -11,7 +11,9 @@ RELEASE_SERVER := tachikoma@signalshell.com
 SIGN_KEY := $(HOME)/.config/section3/release-signing.key
 PLATFORMS := linux/amd64 linux/arm64
 
-.PHONY: build test clean release
+.PHONY: build test clean release check-installer
+
+LANDING_INSTALLER := ../signalshell-landing/install-section3
 
 build:
 	mkdir -p bin
@@ -47,8 +49,21 @@ release:
 	echo "  Uploading release $$NEW_VERSION..."; \
 	rsync --mkpath -av --chmod=D755,F644 $(RELEASE_DIR)/$$NEW_VERSION/ $(RELEASE_SERVER):releases/section3/$$NEW_VERSION/; \
 	rsync --mkpath -av --chmod=F644 $(RELEASE_DIR)/latest.json $(RELEASE_SERVER):releases/section3/latest.json; \
+	rsync --mkpath -av --chmod=F644 install.sh $(RELEASE_SERVER):releases/section3/install.sh; \
 	git add -u && git commit -m "release v$$NEW_VERSION" && git tag "v$$NEW_VERSION"; \
 	echo "  Released version $$NEW_VERSION (committed + tagged)"
+
+## The installer is served from the landing site, so two copies exist. A rule
+## in prose would drift; this makes it checkable.
+check-installer:
+	@if [ ! -f $(LANDING_INSTALLER) ]; then \
+		echo "skip: $(LANDING_INSTALLER) not checked out"; exit 0; fi; \
+	if diff -q install.sh $(LANDING_INSTALLER) >/dev/null; then \
+		echo "installer copies match"; \
+	else \
+		echo "ERROR: install.sh and $(LANDING_INSTALLER) have diverged:"; \
+		diff install.sh $(LANDING_INSTALLER) || true; \
+		exit 1; fi
 
 clean:
 	rm -rf bin $(RELEASE_DIR)
