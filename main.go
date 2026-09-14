@@ -585,10 +585,21 @@ func (s *Supervisor) StartAll() {
 	}
 }
 
+// Stop concurrently: each Stop() allows 5s before SIGKILL, so stopping N
+// services in sequence can outlast docker's stop grace period and get the
+// container killed mid-shutdown. Services share no state, and stop order was
+// never defined -- this ranged over the map.
 func (s *Supervisor) StopAll() {
-	for _, svc := range s.services {
-		svc.Stop()
+	var wg sync.WaitGroup
+	for _, name := range s.serviceKeys {
+		svc := s.services[name]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			svc.Stop()
+		}()
 	}
+	wg.Wait()
 }
 
 func (s *Supervisor) Status() string {
@@ -969,9 +980,11 @@ Commands:
   section3 reload        Reload config (add/remove/redefine services)
   section3 config        Show the config directory and which file declared each service
   section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
-  section3 self version  Show binary version
+  section3 version       Show binary version
   section3 self update   Update the binary to the latest release
   section3 help          Show this help`)
+	case "version", "-v", "--version":
+		printVersion()
 	case "self":
 		if err := runSelf(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)

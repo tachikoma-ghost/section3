@@ -37,7 +37,7 @@ services:
 
 - Monitor all supervised processes
 - On crash: restart with exponential backoff (min 1s, max 60s, multiplier 2x); a run of 60s+ resets the backoff
-- On SIGTERM: stop all services gracefully (SIGTERM, wait 5s, SIGKILL)
+- On SIGTERM: stop all services gracefully, concurrently (SIGTERM, wait 5s, SIGKILL), so total shutdown stays near 5s regardless of service count
 - On SIGHUP: reload config
 
 ## Log Handling
@@ -58,7 +58,7 @@ section3 reload           Reload config (add/remove services)
 section3 status           Show status of all services
 section3 status <name>    Show status of one service
 section3 tail [-n N] [name]  Tail logs (default: 20 lines, all services if no name)
-section3 self version     Show binary version
+section3 version          Show binary version
 section3 self update      Update the binary to the latest release
 section3 help             Show help
 ```

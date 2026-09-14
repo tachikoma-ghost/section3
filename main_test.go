@@ -958,3 +958,35 @@ services:
 		t.Error("LoadConfig with invalid log_max_size: want error, got nil")
 	}
 }
+
+// StopAll must stop services concurrently. Stop() allows each service 5s
+// before SIGKILL, so stopping N of them in sequence can outlast docker's stop
+// grace period and get the container killed mid-shutdown.
+func TestStopAllStopsConcurrently(t *testing.T) {
+	const (
+		n         = 6
+		stopTime  = 300 * time.Millisecond
+		tolerance = 3 // sequential would be n=6x stopTime; allow 3x for load
+	)
+
+	sup := NewSupervisor()
+	for i := 0; i < n; i++ {
+		name := "svc" + strconv.Itoa(i)
+		svc := newTestService(t, "trap 'sleep 0.3; exit 0' TERM; sleep 60", "never")
+		svc.Name = name
+		sup.services[name] = svc
+		sup.serviceKeys = append(sup.serviceKeys, name)
+		if err := svc.Start(); err != nil {
+			t.Fatalf("start %s: %v", name, err)
+		}
+	}
+
+	start := time.Now()
+	sup.StopAll()
+	elapsed := time.Since(start)
+
+	if elapsed > tolerance*stopTime {
+		t.Errorf("StopAll took %v for %d services taking %v each: sequential, not concurrent",
+			elapsed, n, stopTime)
+	}
+}

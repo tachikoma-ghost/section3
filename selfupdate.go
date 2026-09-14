@@ -37,6 +37,11 @@ type releaseManifest struct {
 	Published string `json:"published"`
 }
 
+func printVersion() {
+	fmt.Printf("section3 %s (commit: %s, built: %s, %s/%s)\n",
+		version, commit, buildTime, runtime.GOOS, runtime.GOARCH)
+}
+
 // runSelf handles the "self" command namespace. These commands act on the
 // section3 binary itself and are never forwarded to the daemon, so they
 // cannot collide with service verbs.
@@ -46,8 +51,7 @@ func runSelf(args []string) error {
 	}
 	switch args[0] {
 	case "version":
-		fmt.Printf("section3 %s (commit: %s, built: %s, %s/%s)\n",
-			version, commit, buildTime, runtime.GOOS, runtime.GOARCH)
+		printVersion()
 		return nil
 	case "update":
 		return runSelfUpdate()
