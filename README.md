@@ -21,6 +21,7 @@ section3 restart <name> Restart a service
 section3 reload        Reload config (add/remove/redefine services)
 section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
 section3 version       Show binary version
+section3 self exit     Stop all services and exit
 section3 self update   Update the binary to the latest release
 section3 help          Show this help
 ```
@@ -52,6 +53,10 @@ services:
     command: /usr/local/bin/migrate-db.sh
     restart: never
     dir: /tmp
+
+  dockerd:
+    command: dockerd-rootless.sh
+    stop_timeout: 60s      # needs longer than the 5s default to stop containers
 ```
 
 Restart policies:
@@ -66,9 +71,10 @@ removed from the config, starts newly added ones, and restarts any whose
 `command`, `dir` or `restart` policy changed. Services whose definition is
 unchanged keep running and are not disturbed.
 
-`log_max_size` and `depends_on` do not count as changes: the first decides
-where output goes rather than what runs, and the second is start ordering that
-has already happened. Both take effect for the next start of that service.
+`log_max_size`, `stop_timeout` and `depends_on` do not count as changes: the
+first decides where output goes rather than what runs, the second how it stops,
+and the third is start ordering that has already happened. All take effect for
+the next start of that service.
 
 ## Docker
 

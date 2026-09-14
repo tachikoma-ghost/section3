@@ -49,6 +49,7 @@ const (
 	backoffMul          = 2
 	healthyRunReset     = 60 * time.Second // a run at least this long resets the backoff
 	startStagger        = 100 * time.Millisecond
+	defaultStopTimeout  = 5 * time.Second // per service; override with stop_timeout:
 	maxLogSize          = 1 * 1024 * 1024 // 1MB
 	maxLogBackups       = 5               // rotated copies kept per log (.1 .. .5)
 	rotateRetryCooldown = 30 * time.Second
@@ -68,11 +69,12 @@ type Config struct {
 }
 
 type ServiceConfig struct {
-	Command    string   `yaml:"command"`
-	Dir        string   `yaml:"dir"`
-	Restart    string   `yaml:"restart"`      // always, never, on-crash
-	LogMaxSize string   `yaml:"log_max_size"` // e.g. "10M", "512K"; default 1M
-	DependsOn  []string `yaml:"depends_on"`
+	Command     string   `yaml:"command"`
+	Dir         string   `yaml:"dir"`
+	Restart     string   `yaml:"restart"`      // always, never, on-crash
+	LogMaxSize  string   `yaml:"log_max_size"` // e.g. "10M", "512K"; default 1M
+	StopTimeout string   `yaml:"stop_timeout"` // e.g. "30s"; default 5s
+	DependsOn   []string `yaml:"depends_on"`
 }
 
 // parseSize parses a human-readable size like "10M", "512K", "1G", or a
@@ -97,14 +99,15 @@ func parseSize(s string) (int64, error) {
 }
 
 type Service struct {
-	Name       string
-	Command    string
-	Dir        string
-	Restart    string
-	logMaxSize int64
-	cmd        *exec.Cmd
-	logw       *rotatingWriter
-	logPath    string
+	Name        string
+	Command     string
+	Dir         string
+	Restart     string
+	logMaxSize  int64
+	stopTimeout time.Duration
+	cmd         *exec.Cmd
+	logw        *rotatingWriter
+	logPath     string
 
 	mu         sync.Mutex
 	stopped    bool
@@ -199,6 +202,9 @@ func (s *Supervisor) loadFile(path string) error {
 		if sc.Restart == "" {
 			sc.Restart = cfg.Defaults.Restart
 		}
+		if sc.StopTimeout == "" {
+			sc.StopTimeout = cfg.Defaults.StopTimeout
+		}
 		if sc.LogMaxSize == "" {
 			sc.LogMaxSize = cfg.Defaults.LogMaxSize
 		}
@@ -210,13 +216,25 @@ func (s *Supervisor) loadFile(path string) error {
 			}
 			logMaxSize = n
 		}
+		stop := time.Duration(defaultStopTimeout)
+		if sc.StopTimeout != "" {
+			d, err := time.ParseDuration(sc.StopTimeout)
+			if err != nil {
+				return fmt.Errorf("service %s: stop_timeout: %w", name, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("service %s: stop_timeout must be positive, got %s", name, sc.StopTimeout)
+			}
+			stop = d
+		}
 		s.services[name] = &Service{
-			Name:       name,
-			Command:    sc.Command,
-			Dir:        sc.Dir,
-			Restart:    sc.Restart,
-			logMaxSize: logMaxSize,
-			logPath:    filepath.Join(logDir, name+".log"),
+			Name:        name,
+			Command:     sc.Command,
+			Dir:         sc.Dir,
+			Restart:     sc.Restart,
+			logMaxSize:  logMaxSize,
+			stopTimeout: stop,
+			logPath:     filepath.Join(logDir, name+".log"),
 		}
 		s.serviceKeys = append(s.serviceKeys, name)
 	}
@@ -543,7 +561,7 @@ func (s *Service) Stop() error {
 		if done != nil {
 			select {
 			case <-done:
-			case <-time.After(5 * time.Second):
+			case <-time.After(s.stopGrace()):
 				// Kill the whole group: a lone Process.Kill leaves
 				// grandchildren alive, still holding the log pipe.
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -554,6 +572,15 @@ func (s *Service) Stop() error {
 
 	drainAndClose(logw, copyDone)
 	return nil
+}
+
+// stopGrace is how long Stop waits after SIGTERM before SIGKILL. Zero means
+// the service was built outside LoadConfig (tests), so fall back to the default.
+func (s *Service) stopGrace() time.Duration {
+	if s.stopTimeout <= 0 {
+		return defaultStopTimeout
+	}
+	return s.stopTimeout
 }
 
 func (s *Service) Status() string {
@@ -649,7 +676,8 @@ func (s *Supervisor) Tail(name string, n int) string {
 // Only the fields that determine the process are compared. logMaxSize is
 // deliberately not among them: it changes where output goes, not what runs,
 // and bouncing a service to resize its log would cost more than it buys.
-// DependsOn is likewise about start ordering, which has already happened.
+// DependsOn is likewise about start ordering, which has already happened, and
+// stopTimeout about how it stops rather than what runs.
 func (s *Service) sameDefinition(other *Service) bool {
 	if s == nil || other == nil {
 		return false
@@ -828,6 +856,13 @@ func handleConn(conn net.Conn) {
 		}
 		fmt.Fprintf(w, "restarted %s\n", name)
 
+	case "exit":
+		fmt.Fprintln(w, "stopping")
+		w.Flush()
+		conn.Close()
+		requestShutdown()
+		return
+
 	case "reload":
 		if err := reloadConfig(); err != nil {
 			fmt.Fprintf(w, "ERROR: %v\n", err)
@@ -901,6 +936,18 @@ func dialDaemon(args []string) error {
 
 // --- Daemon ---
 
+// shutdown is closed by `section3 self exit` so the daemon takes the same path
+// it takes on SIGTERM. Restarting afterwards is the supervisor's business, not
+// section3's -- run bare, exit means exit.
+var (
+	shutdown     = make(chan struct{})
+	shutdownOnce sync.Once
+)
+
+func requestShutdown() {
+	shutdownOnce.Do(func() { close(shutdown) })
+}
+
 func runDaemon() {
 	// Single-instance guard: if we can connect, a daemon is already running.
 	if conn, err := net.DialTimeout("unix", socketPath, time.Second); err == nil {
@@ -941,12 +988,12 @@ func runDaemon() {
 		select {
 		case <-term:
 			log.Println("section3: shutting down...")
-			ln.Close()
-			os.Remove(socketPath)
-			supervisorMu.RLock()
-			sup := supervisor
-			supervisorMu.RUnlock()
-			sup.StopAll()
+			stopAndClose(ln)
+			return
+
+		case <-shutdown:
+			log.Println("section3: exit requested, shutting down...")
+			stopAndClose(ln)
 			return
 
 		case <-hup:
@@ -956,6 +1003,15 @@ func runDaemon() {
 			}
 		}
 	}
+}
+
+func stopAndClose(ln net.Listener) {
+	ln.Close()
+	os.Remove(socketPath)
+	supervisorMu.RLock()
+	sup := supervisor
+	supervisorMu.RUnlock()
+	sup.StopAll()
 }
 
 // --- Entry point ---
@@ -982,6 +1038,7 @@ Commands:
   section3 tail [-n N] [name]  Show last N log lines (default: 20, all if no name)
   section3 version       Show binary version
   section3 self update   Update the binary to the latest release
+  section3 self exit     Stop all services and exit (a supervisor may restart it)
   section3 help          Show this help`)
 	case "version", "-v", "--version":
 		printVersion()

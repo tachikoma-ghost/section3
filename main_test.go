@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -988,5 +989,88 @@ func TestStopAllStopsConcurrently(t *testing.T) {
 	if elapsed > tolerance*stopTime {
 		t.Errorf("StopAll took %v for %d services taking %v each: sequential, not concurrent",
 			elapsed, n, stopTime)
+	}
+}
+
+// A service that ignores SIGTERM must be killed after its own stop_timeout,
+// not the 5s default: dockerd with running containers needs longer than 5s,
+// and a fast-failing service should not hold up a shutdown for 5s either.
+func TestStopHonoursStopTimeout(t *testing.T) {
+	// The shell ignores TERM; the sleep children are killed with the group but
+	// the loop outlives them, so the process survives until SIGKILL.
+	svc := newTestService(t, "trap '' TERM; while :; do sleep 0.1; done", "never")
+	svc.stopTimeout = 300 * time.Millisecond
+	if err := svc.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// Let the shell install its trap; SIGTERM before that still kills it.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	svc.Stop()
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("Stop took %v with stop_timeout=300ms: using the default instead", elapsed)
+	}
+	if elapsed < 300*time.Millisecond {
+		t.Errorf("Stop took %v: SIGKILLed before its stop_timeout elapsed", elapsed)
+	}
+}
+
+func TestLoadConfigStopTimeout(t *testing.T) {
+	dir := t.TempDir()
+	origConfigDir := configDir
+	configDir = dir
+	t.Cleanup(func() { configDir = origConfigDir })
+
+	write := func(body string) error {
+		if err := os.WriteFile(filepath.Join(dir, "svc.yml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return NewSupervisor().LoadConfig()
+	}
+
+	sup := NewSupervisor()
+	if err := os.WriteFile(filepath.Join(dir, "svc.yml"),
+		[]byte("services:\n  a:\n    command: true\n    stop_timeout: 30s\n  b:\n    command: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.LoadConfig(); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := sup.services["a"].stopTimeout; got != 30*time.Second {
+		t.Errorf("a: stop_timeout = %v, want 30s", got)
+	}
+	if got := sup.services["b"].stopGrace(); got != defaultStopTimeout {
+		t.Errorf("b: stopGrace = %v, want the %v default", got, defaultStopTimeout)
+	}
+
+	if err := write("services:\n  a:\n    command: true\n    stop_timeout: soon\n"); err == nil {
+		t.Error("stop_timeout: soon accepted; want a parse error")
+	}
+	if err := write("services:\n  a:\n    command: true\n    stop_timeout: -5s\n"); err == nil {
+		t.Error("negative stop_timeout accepted; want an error")
+	}
+}
+
+// `section3 self exit` must reach the daemon and trigger the same shutdown
+// path as SIGTERM. Bare, exit means exit; under a supervisor it restarts.
+func TestSelfExitRequestsShutdown(t *testing.T) {
+	ln := startTestServer(t, map[string]*Service{})
+	t.Cleanup(func() { ln.Close() })
+
+	origShutdown, origOnce := shutdown, shutdownOnce
+	shutdown, shutdownOnce = make(chan struct{}), sync.Once{}
+	t.Cleanup(func() { shutdown, shutdownOnce = origShutdown, origOnce })
+
+	if err := dialDaemon([]string{"exit"}); err != nil {
+		t.Fatalf("self exit: %v", err)
+	}
+
+	select {
+	case <-shutdown:
+	case <-time.After(2 * time.Second):
+		t.Error("daemon did not request shutdown after `self exit`")
 	}
 }

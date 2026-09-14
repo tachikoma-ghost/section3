@@ -22,13 +22,14 @@ services:
     dir: /workspace          # working directory (optional)
     restart: always | never | on-crash
     log_max_size: 10M        # log rotation threshold (optional, default 1M)
+    stop_timeout: 30s        # SIGTERM grace before SIGKILL (optional, default 5s)
     depends_on:
       - other-service
 ```
 
 ## Startup
 
-1. Read `/workspace/section3.yml`
+1. Read every `*.yml` in the config directory (`$XDG_CONFIG_HOME/section3/conf.d`)
 2. Sort service names alphabetically
 3. Fork+exec each service with small stagger (100ms)
 4. Block in supervisor loop
@@ -37,7 +38,7 @@ services:
 
 - Monitor all supervised processes
 - On crash: restart with exponential backoff (min 1s, max 60s, multiplier 2x); a run of 60s+ resets the backoff
-- On SIGTERM: stop all services gracefully, concurrently (SIGTERM, wait 5s, SIGKILL), so total shutdown stays near 5s regardless of service count
+- On SIGTERM: stop all services gracefully, concurrently (SIGTERM, wait `stop_timeout`, SIGKILL), so total shutdown stays near the longest `stop_timeout` rather than their sum
 - On SIGHUP: reload config
 
 ## Log Handling
@@ -59,6 +60,7 @@ section3 status           Show status of all services
 section3 status <name>    Show status of one service
 section3 tail [-n N] [name]  Tail logs (default: 20 lines, all services if no name)
 section3 version          Show binary version
+section3 self exit        Stop all services and exit
 section3 self update      Update the binary to the latest release
 section3 help             Show help
 ```

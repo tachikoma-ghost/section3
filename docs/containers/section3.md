@@ -24,6 +24,7 @@ section3 restart <name> Restart a service
 section3 reload        Reload config (add/remove services)
 section3 tail [-n N] [name]  Show last N log lines (default: 20)
 section3 version       Show binary version
+section3 self exit     Stop all services and exit
 section3 self update   Update the binary to the latest release
 section3 help          Show help
 ```

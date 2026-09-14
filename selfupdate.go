@@ -42,12 +42,12 @@ func printVersion() {
 		version, commit, buildTime, runtime.GOOS, runtime.GOARCH)
 }
 
-// runSelf handles the "self" command namespace. These commands act on the
-// section3 binary itself and are never forwarded to the daemon, so they
-// cannot collide with service verbs.
+// runSelf handles the "self" command namespace. These commands act on section3
+// itself rather than on a service, so they cannot collide with service verbs.
+// "exit" is the one that reaches the daemon: it acts on the running process.
 func runSelf(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: section3 self <version|update>")
+		return fmt.Errorf("usage: section3 self <version|update|exit>")
 	}
 	switch args[0] {
 	case "version":
@@ -55,8 +55,10 @@ func runSelf(args []string) error {
 		return nil
 	case "update":
 		return runSelfUpdate()
+	case "exit":
+		return dialDaemon([]string{"exit"})
 	default:
-		return fmt.Errorf("unknown self command: %q (usage: section3 self <version|update>)", args[0])
+		return fmt.Errorf("unknown self command: %q (usage: section3 self <version|update|exit>)", args[0])
 	}
 }
 

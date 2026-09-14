@@ -17,6 +17,7 @@ services:
     dir: /workspace           # working directory; uses defaults.dir if omitted
     restart: always           # always | never | on-crash
     log_max_size: 100M        # rotation threshold; uses defaults if omitted
+    stop_timeout: 30s         # SIGTERM grace before SIGKILL; default 5s
     depends_on:               # parsed but not enforced (see system.md)
       - other-service
 ```
@@ -29,14 +30,16 @@ services:
 | `dir` | string | `defaults.dir` | Working directory for the service |
 | `restart` | string | `defaults.restart` | `always` \| `never` \| `on-crash` |
 | `log_max_size` | string | `defaults.log_max_size`, else `1M` | Log rotation threshold; accepts `K`/`M`/`G` suffixes or plain bytes |
+| `stop_timeout` | duration | `defaults.stop_timeout`, else `5s` | How long SIGTERM is given before SIGKILL; any Go duration, e.g. `30s`, `2m` |
 | `depends_on` | list | none | Service names this depends on (not enforced) |
 
-An invalid `log_max_size` is a config error: `LoadConfig` fails and `reload`
-reports it instead of falling back silently.
+An invalid `log_max_size` or `stop_timeout` is a config error: `LoadConfig`
+fails and `reload` reports it instead of falling back silently. A
+non-positive `stop_timeout` is rejected for the same reason.
 
 ## Defaults
 
-The `defaults` block sets fallback values for all services. A service with an explicit `dir:`, `restart:`, or `depends_on:` uses that value instead of the default. Omitting the key entirely uses the default.
+The `defaults` block sets fallback values for all services. A service with an explicit `dir:`, `restart:`, `stop_timeout:` or `depends_on:` uses that value instead of the default. Omitting the key entirely uses the default.
 
 Example:
 ```yaml
